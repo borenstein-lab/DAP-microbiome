@@ -1,0 +1,456 @@
+---
+title: "DAP dogs' lab test associations with the microbiome"
+author: "Borenstein Lab"
+date: "April 2025"
+output: html_notebook
+---
+# Preparations
+
+```{r message=FALSE, warning=FALSE}
+# Preparations
+library(readr)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(ape)
+library(cowplot)
+library(vegan)
+library(stringr)
+library(tidymodels)
+library(stringr)
+options(scipen = 999)
+library(corrplot)
+library(forcats)
+library(ggforce)
+library(chattr)
+library(metap)
+library(rstatix)
+library(ggprism)
+library(performance)
+library(lme4)
+
+```
+
+
+# Load data and metadata
+```{r}
+metadata_dir <- "../data/metadata"
+
+# Load codebook
+codebook <- read_csv(file.path(metadata_dir, "terra_release_2023_12022024", "DAP_2023_Codebook_v1.0.csv"),
+                     show_col_types = FALSE,
+                     guess_max = 50000)
+
+# Take only precision 1 dogs with metagenomics
+dap_id_subset <- sample_map%>%
+  select(dap_dog_id, sample_id)%>%
+  filter(sample_id %in% ra_kraken_sp$sample_id)
+
+#Filter dogs that don't have weight (3 dogs)
+sample_map <- drop_na(sample_map, weight_from_vet_or_survey_lbs)
+
+# Define fixed effects
+FIXED <- c("breed_size_numeric", "Sex_class" , "age_at_stool_collection", "hs_general_health", "total_reads_before_filtering", "weight_from_vet_or_survey_lbs", "duplication_rate")
+RAND <- c("pool")
+
+duplication_data <- qc_stats%>%
+  select(sample_id, total_reads_before_filtering, duplication_rate)
+
+fixed_effect_data <- sample_map %>%
+  left_join(select(dog_owner, dap_dog_id, hs_general_health))%>%
+  left_join(duplication_data, by = "sample_id")%>%
+  select(all_of(c("dap_dog_id" , FIXED, "pool")))
+
+# Define dog_overview of dogs with excellent health only.
+excellent_health_sample_map <- sample_map %>%
+  filter(hs_general_health == 1) 
+
+non_excellent_health_sample_map <- sample_map %>%
+  filter(hs_general_health >= 3) 
+
+  
+```
+## Import clinical lab test
+```{r}
+
+# Import CBC lab test
+cbc_lab_test <- read_csv(file.path(metadata_dir,"terra_release_2023_12022024","DAP_2023_SamplesResults_CBC_v1.0.csv"), 
+                         show_col_types = FALSE, na = c('NA'))%>%
+  filter(Sample_Year == "precision_1")%>%
+  rename(dap_dog_id = dog_id )%>%
+  filter(dap_dog_id %in% dap_id_subset$dap_dog_id)%>%
+  mutate(dap_dog_id = as.character(dap_dog_id))%>%
+  filter(dap_dog_id %in% sample_map$dap_dog_id)%>%
+  select(where(~ !all(is.na(.))))%>%
+  select(-c(krt_cbc_abs_bands, krt_cbc_pcv, krt_cbc_plt_quant, krt_cbc_plt_morph, krt_cbc_plt_morph_num, krt_cbc_rbc_morph, krt_cbc_rbc_morph_2, krt_cbc_rbc_morph_3, krt_cbc_rbc_morph_num, krt_cbc_rbc_morph_num_2, krt_cbc_wbc_morph, krt_cbc_wbc_morph_num, krt_cbc_hemoparasites, krt_cbc_test_comments, krt_cbc_abs_metamyelocytes, krt_cbc_abs_other_cells, krt_cbc_rel_metamyelocytes, krt_cbc_rel_bands, krt_cbc_rel_basophils, "krt_cbc_pct","krt_cbc_plt_morph_2", "krt_cbc_plt_morph_num_2", "krt_cbc_nucleated_rbcs" , "krt_cbc_rbc_morph_num_3"))%>%   select(-matches("krt_cbc_rel*"))%>%
+  left_join(select(sample_map, sample_id, dap_dog_id))%>%
+  #define normal range
+  mutate(int_krt_cbc_total_wbcs = case_when(krt_cbc_total_wbcs>12.47 ~ "high",
+                                        krt_cbc_total_wbcs< 4.74 ~ "low",
+                                        krt_cbc_total_wbcs<=12.47 & krt_cbc_total_wbcs>= 4.74 ~ "regular"),
+         int_krt_cbc_abs_neutrophils = case_when(krt_cbc_abs_neutrophils>9.94 ~ "high",
+                                        krt_cbc_abs_neutrophils< 2.15 ~ "low",
+                                        krt_cbc_abs_neutrophils<=9.94 & krt_cbc_abs_neutrophils>= 2.15 ~ "regular"),
+         int_krt_cbc_abs_lymphocytes = case_when(krt_cbc_abs_lymphocytes>3.4 ~ "high",
+                                        krt_cbc_abs_lymphocytes< 0.8 ~ "low",
+                                        krt_cbc_abs_lymphocytes<=3.4 & krt_cbc_abs_lymphocytes>= 0.8 ~ "regular"),
+         int_krt_cbc_abs_monocytes = if_else(krt_cbc_abs_monocytes> 1.02, true = "high", false = "regular"),
+         int_krt_cbc_rbc = case_when(krt_cbc_rbc>7.9 ~ "high",
+                                        krt_cbc_rbc< 5.16 ~ "low",
+                                        krt_cbc_rbc<=7.9 & krt_cbc_rbc>= 5.16 ~ "regular"),
+         int_krt_cbc_hgb =case_when(krt_cbc_hgb>19.8 ~ "high",
+                                        krt_cbc_hgb< 13.2 ~ "low",
+                                        krt_cbc_hgb<=19.8 & krt_cbc_hgb>= 13.2 ~ "regular"), 
+         int_krt_cbc_hct =case_when(krt_cbc_hct>56.7 ~ "high",
+                                        krt_cbc_hct< 36.8 ~ "low",
+                                        krt_cbc_hct<=56.7 & krt_cbc_hct>= 36.8 ~ "regular"),
+          int_krt_cbc_mcv =case_when(krt_cbc_mcv>78 ~ "high",
+                                        krt_cbc_mcv< 62 ~ "low",
+                                        krt_cbc_mcv<=78 & krt_cbc_mcv>= 62 ~ "regular"),
+         int_krt_cbc_mch =case_when(krt_cbc_mch>26.5 ~ "high",
+                                        krt_cbc_mch< 21.8 ~ "low",
+                                        krt_cbc_mch<=26.5 & krt_cbc_mch>= 21.8 ~ "regular"),
+         int_krt_cbc_mchc =case_when(krt_cbc_mchc>37.8 ~ "high",
+                                        krt_cbc_mchc< 32.4 ~ "low",
+                                        krt_cbc_mchc<=37.8 & krt_cbc_mchc>= 32.4 ~ "regular"),
+         int_krt_cbc_rdw =case_when(krt_cbc_rdw>13.7 ~ "high",
+                                        krt_cbc_rdw< 11.1 ~ "low",
+                                        krt_cbc_rdw<=13.7 & krt_cbc_rdw>= 11.1 ~ "regular"),
+         int_krt_cbc_plt =case_when(krt_cbc_plt>480 ~ "high",
+                                        krt_cbc_plt< 167 ~ "low",
+                                        krt_cbc_plt<=480 & krt_cbc_plt>= 167 ~ "regular"),
+         int_krt_cbc_mpv =case_when(krt_cbc_mpv>13.5 ~ "high",
+                                        krt_cbc_mpv< 6.1 ~ "low",
+                                        krt_cbc_mpv<=13.5 & krt_cbc_mpv>= 6.1 ~ "regular"), 
+
+         
+         )
+
+cbc_numeric_columns <- cbc_lab_test %>%
+  select_if(is.numeric) %>%
+  names()
+
+# Import CP lab test
+cp_lab_test <- read_csv(file.path(metadata_dir,"terra_release_2023_12022024","DAP_2023_SamplesResults_ChemistryPanel_v1.0.csv"), show_col_types = FALSE, na = c('NA'))%>%
+  filter(Sample_Year == "precision_1")%>%
+  rename(dap_dog_id = dog_id )%>%
+  filter(dap_dog_id %in% dap_id_subset$dap_dog_id)%>%
+  mutate(dap_dog_id = as.character(dap_dog_id))%>%
+  filter(dap_dog_id %in% sample_map$dap_dog_id)%>%
+  select(where(~ !all(is.na(.))))%>%
+  select(-krt_cp_test_comments)%>%
+  left_join(select(sample_map, sample_id, dap_dog_id))%>%
+  mutate(int_krt_cp_total_protein_value =  case_when(krt_cp_total_protein_value>7.4 ~ "high",
+                                        krt_cp_total_protein_value< 5.3 ~ "low",
+                                        krt_cp_total_protein_value<=7.4 & krt_cp_total_protein_value>= 5.3 ~ "regular"),
+         int_krt_cp_albumin_value =  case_when(krt_cp_albumin_value>3.7 ~ "high",
+                                        krt_cp_albumin_value< 2.7 ~ "low",
+                                        krt_cp_albumin_value<=3.7 & krt_cp_albumin_value>= 2.7 ~ "regular"),
+                 int_krt_cp_globulins_value =  case_when(krt_cp_globulins_value>4.1 ~ "high",
+                                        krt_cp_globulins_value< 2.2 ~ "low",
+                                        krt_cp_globulins_value<=4.1 & krt_cp_globulins_value>= 2.2 ~ "regular"),
+                 int_krt_cp_alb_glob_ratio_value =  case_when(krt_cp_alb_glob_ratio_value>1.5 ~ "high",
+                                        krt_cp_alb_glob_ratio_value< 0.8 ~ "low",
+                                        krt_cp_alb_glob_ratio_value<=1.5 & krt_cp_alb_glob_ratio_value>= 0.8 ~ "regular"),
+                 int_krt_cp_calcium_value =  case_when(krt_cp_calcium_value>11.1 ~ "high",
+                                        krt_cp_calcium_value< 8.6 ~ "low",
+                                        krt_cp_calcium_value<11.1 & krt_cp_calcium_value> 8.6 ~ "regular"),
+        int_krt_cp_phosphorus_value = case_when(krt_cp_phosphorus_value>5.2 ~ "high",
+                                        krt_cp_phosphorus_value< 2.5 ~ "low",
+                                        krt_cp_phosphorus_value<=5.2 & krt_cp_phosphorus_value>= 2.5 ~ "regular"),
+                 int_krt_cp_magnesium_value =  case_when(krt_cp_magnesium_value>4.1 ~ "high",
+                                        krt_cp_magnesium_value< 1.4 ~ "low",
+                                        krt_cp_magnesium_value<=4.1 & krt_cp_magnesium_value>= 1.4 ~ "regular"),
+                 int_krt_cp_glucose_value =  case_when(krt_cp_glucose_value>116 ~ "high",
+                                        krt_cp_glucose_value< 71 ~ "low",
+                                        krt_cp_glucose_value<=116 & krt_cp_glucose_value>= 71 ~ "regular"),
+                 int_krt_cp_bun_value =  case_when(krt_cp_bun_value>29 ~ "high",
+                                        krt_cp_bun_value< 9 ~ "low",
+                                        krt_cp_bun_value<=29 & krt_cp_bun_value>= 9 ~ "regular"),
+                 int_krt_cp_creatinine_value =  case_when(krt_cp_creatinine_value>1.4 ~ "high",
+                                        krt_cp_creatinine_value< 0.56 ~ "low",
+                                        krt_cp_creatinine_value<=1.4 & krt_cp_creatinine_value>= 0.56 ~ "regular"),
+                 int_krt_cp_bilirubin_total_value =  case_when(krt_cp_bilirubin_total_value>0.3 ~ "high",
+                                        krt_cp_bilirubin_total_value< 0.1 ~ "low",
+                                        krt_cp_bilirubin_total_value<=0.3 & krt_cp_bilirubin_total_value>= 0.1 ~ "regular"),
+                 int_krt_cp_alkp_value =  case_when(krt_cp_alkp_value>145 ~ "high",
+                                        krt_cp_alkp_value< 13 ~ "low",
+                                        krt_cp_alkp_value<=145 & krt_cp_alkp_value>= 13 ~ "regular"),
+                 int_krt_cp_alt_value =  case_when(krt_cp_alt_value>84 ~ "high",
+                                        krt_cp_alt_value< 18 ~ "low",
+                                        krt_cp_alt_value<=84 & krt_cp_alt_value>= 84 ~ "regular"),
+                 int_krt_cp_ggt_value =  case_when(krt_cp_ggt_value>6 ~ "high",
+                                        krt_cp_ggt_value< 3 ~ "low",
+                                        krt_cp_ggt_value<=6 & krt_cp_ggt_value>= 3 ~ "regular"),
+                 int_krt_cp_amylase_value =  case_when(krt_cp_amylase_value>798 ~ "high",
+                                        krt_cp_amylase_value< 224 ~ "low",
+                                        krt_cp_amylase_value<=798 & krt_cp_amylase_value>= 224 ~ "regular"),
+                 int_krt_cp_triglycerides_value =  case_when(krt_cp_triglycerides_value>108 ~ "high",
+                                        krt_cp_triglycerides_value< 26 ~ "low",
+                                        krt_cp_triglycerides_value<=108 & krt_cp_triglycerides_value>= 26 ~ "regular"),
+                 int_krt_cp_cholesterol_value =  case_when(krt_cp_cholesterol_value>335 ~ "high",
+                                        krt_cp_cholesterol_value< 124 ~ "low",
+                                        krt_cp_cholesterol_value<=335 & krt_cp_cholesterol_value>= 124 ~ "regular"),
+                 int_krt_cp_sodium_value =  case_when(krt_cp_sodium_value>151 ~ "high",
+                                        krt_cp_sodium_value< 143 ~ "low",
+                                        krt_cp_sodium_value<=151 & krt_cp_sodium_value>= 143 ~ "regular"),
+                 int_krt_cp_potassium_value =  case_when(krt_cp_potassium_value>5.5 ~ "high",
+                                        krt_cp_potassium_value< 3.7 ~ "low",
+                                        krt_cp_potassium_value<=5.5 & krt_cp_potassium_value>= 3.7 ~ "regular"),
+                 int_krt_cp_chloride_value =  case_when(krt_cp_chloride_value>116 ~ "high",
+                                        krt_cp_chloride_value< 107 ~ "low",
+                                        krt_cp_chloride_value<=116 & krt_cp_chloride_value>= 107 ~ "regular"),
+                 int_krt_cp_sp_ratio_value =  case_when(krt_cp_sp_ratio_value>39.7 ~ "high",
+                                        krt_cp_sp_ratio_value< 26.7 ~ "low",
+                                        krt_cp_sp_ratio_value<=39.7 & krt_cp_sp_ratio_value>= 26.7 ~ "regular"))
+  # left_join(fixed_effect_data)
+
+cp_numeric_columns <- cp_lab_test %>%
+  select_if(is.numeric) %>%
+  names()
+
+#Import urine lab test - mostly char
+urine_lab_test <- read_csv(file.path(metadata_dir,"terra_release_2023_12022024","DAP_2023_SamplesResults_Urine_v1.0.csv"), show_col_types = FALSE, na = c('NA'))%>%
+  filter(Sample_Year == "precision_1")%>%
+  rename(dap_dog_id = dog_id )%>%
+  filter(dap_dog_id %in% dap_id_subset$dap_dog_id)%>%
+  mutate(dap_dog_id = as.character(dap_dog_id))%>%
+  left_join(select(sample_map, sample_id, dap_dog_id))%>%
+  mutate(krt_urine_sg = if_else(krt_urine_sg== ">1.060", true = "1.06", false = krt_urine_sg),
+         krt_urine_sg = as.numeric(krt_urine_sg),
+         krt_urine_ph = as.numeric(krt_urine_ph))%>%
+  # Take only dogs in sample_map
+  filter(dap_dog_id %in% sample_map$dap_dog_id)
+
+# List of numeric lab tests
+urine_numeric_columns <- c("krt_urine_sg", "krt_urine_ph")
+
+```
+## Diet data
+
+```{r}
+# Import diet data
+diet_codes <- c('df_appetite',
+                'df_feedings_per_day',
+                'df_primary_diet_component',
+                'df_treats_frequency',
+                'de_drinking_water_is_filtered',
+                'de_eats_feces',
+                'de_eats_grass_frequency',
+                'df_primary_diet_component_grain_free',
+                'df_primary_diet_component_organic',
+                'df_daily_supplements_antiox',
+                'df_daily_supplements_chondroitin',
+                'df_daily_supplements_fiber',
+                'df_daily_supplements_glucosamine',
+                'df_daily_supplements_omega3',
+                'df_daily_supplements_probiotics',
+                'df_daily_supplements_vitamins')
+
+# Collect diet data
+diet_data <- dog_owner %>%
+  select(dap_dog_id, all_of(diet_codes)) %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  mutate(df_daily_supplements_antiox =      ifelse(is.na(df_daily_supplements_antiox)      | df_daily_supplements_antiox==0, 0, 1)) %>%
+  mutate(df_daily_supplements_chondroitin = ifelse(is.na(df_daily_supplements_chondroitin) | 
+                                                     df_daily_supplements_chondroitin==0, 0, 1)) %>%
+  mutate(df_daily_supplements_fiber =       ifelse(is.na(df_daily_supplements_fiber)       | df_daily_supplements_fiber==0, 0, 1)) %>%
+  mutate(df_daily_supplements_glucosamine = ifelse(is.na(df_daily_supplements_glucosamine) | 
+                                                     df_daily_supplements_glucosamine==0, 0, 1)) %>%
+  mutate(df_daily_supplements_omega3 =      ifelse(is.na(df_daily_supplements_omega3)      | df_daily_supplements_omega3==0, 0, 1)) %>%
+  mutate(df_daily_supplements_probiotics =  ifelse(is.na(df_daily_supplements_probiotics)  | 
+                                                     df_daily_supplements_probiotics==0, 0, 1)) %>%
+  mutate(df_daily_supplements_vitamins =    ifelse(is.na(df_daily_supplements_vitamins)    | 
+                                                     df_daily_supplements_vitamins==0, 0, 1)) %>%
+  mutate(df_primary_diet_component = str_c("primary_diet_", df_primary_diet_component)) %>%
+  mutate(value = 1) %>%
+  pivot_wider(names_from = "df_primary_diet_component", values_from = "value", values_fill = 0) %>%
+  mutate(df_treats_frequency = ifelse(df_treats_frequency %in% 2:3, 1, 0)) %>%
+  mutate(de_drinking_water_is_filtered = ifelse(de_drinking_water_is_filtered < 99, de_drinking_water_is_filtered, NA)) %>%
+  mutate(de_eats_feces = ifelse(de_eats_feces < 99, de_eats_feces, NA)) %>%
+  mutate(df_primary_diet_component_grain_free = ifelse(df_primary_diet_component_grain_free == "TRUE", 1, 0)) %>%
+  mutate(df_primary_diet_component_organic = ifelse(df_primary_diet_component_organic == "TRUE", 1, 0))   
+
+# Drop primary diet categories that are pretty rare
+for (feat in grep('^primary_diet_', names(diet_data), value = T)) {
+  if (min(table(diet_data[[feat]])) < 20) {
+    message('Removed ', feat)
+    diet_data[[feat]] <- NULL
+  }
+}
+
+
+
+```
+# Varience explained analysis
+```{r}
+cp_bc <- map(.x = cp_numeric_columns, 
+             .f = ~get_var_explained(bc, cp_lab_test%>%left_join(fixed_effect_data)%>%left_join(diet_pca_data),
+                                     .x,fixed_effects = c(FIXED,"pool", "diet_pc1", "diet_pc2", "diet_pc3", "diet_pc4")))%>%
+  bind_rows()
+
+cbc_bc <- map(.x = cbc_numeric_columns, 
+    .f = ~get_var_explained(bc, cbc_lab_test%>%left_join(fixed_effect_data)%>%left_join(diet_pca_data),
+                            .x, fixed_effects = c(FIXED,"pool", "diet_pc1", "diet_pc2", "diet_pc3", "diet_pc4")))%>%
+  bind_rows()
+
+urine_bc <- map(.x = urine_numeric_columns, 
+    .f = ~get_var_explained(bc, urine_lab_test%>%left_join(fixed_effect_data)%>%left_join(diet_pca_data),
+                            .x, fixed_effects = c(FIXED,"pool", "diet_pc1", "diet_pc2", "diet_pc3", "diet_pc4")))%>%
+  bind_rows()
+
+```
+
+## Plot variance explained per feature type
+```{r fig.width=4, fig.height=4}
+
+var_exp_data <- bind_rows(cp_bc, cbc_bc, urine_bc)%>%
+  left_join(select(codebook, Variable, SurveyText), by = c("metadata_col" = "Variable"))%>%
+  mutate(SurveyText = str_remove(SurveyText, "Value"))%>%
+  mutate(SurveyText = factor(SurveyText)%>%fct_reorder(mean_pctexp ))%>%
+  mutate(lab_test = case_when(metadata_col %in% cbc_numeric_columns ~ "Complete Blood Count",
+                              metadata_col %in% cp_numeric_columns ~ "Chemistry Profile",
+                              metadata_col %in% urine_numeric_columns ~ "Urine" ))
+
+
+# Plot mean var explain per data type
+bio_groups <- var_exp_data%>%
+  filter(regressor %in% c("Microbiome", "Sex", "hs_general_health", "age_at_stool_collection", "breed_size_numeric","hs_general_health", "weight_from_vet_or_survey_lbs", "diet_pc1", "diet_pc2", "diet_pc3", "diet_pc4" ))%>%
+  # Change variable names
+  mutate(regressor = case_when(regressor == "hs_general_health" ~ "Health Status",
+                               regressor == "age_at_stool_collection" ~ "Age",
+                               regressor == "breed_size_numeric" ~ "Breed Size",
+                               regressor == "Microbiome" ~ "Microbiome",
+                               regressor == "Sex" ~ "Sex",
+                               regressor == "weight_from_vet_or_survey_lbs" ~ "Weight",
+                               regressor == "diet_pc1" | regressor == "diet_pc2" |regressor == "diet_pc3" |regressor == "diet_pc4"  ~ "Diet" ))
+
+p_value_table <- bio_groups%>%
+  mutate(regressor = as.character(regressor))%>%
+  rstatix::wilcox_test(mean_pctexp~regressor,  p.adjust.method = "BH" )%>%
+  # filter(p.adj<0.1)%>%
+  filter(group1 == "Microbiome" | group2 == "Microbiome")%>%
+  mutate(p.adj = format(p.adj, scientific = TRUE))
+   
+bio_groups <- bio_groups%>%
+  group_by(regressor)%>%
+  mutate(median_regressor = median(mean_pctexp))%>%
+  ungroup()%>%
+  mutate(regressor = as.factor(regressor)%>%fct_reorder(median_regressor))
+      
+ggplot(bio_groups, aes(x = regressor, y = mean_pctexp))+
+    geom_jitter(height = 0.15, size = 1.5, alpha = 0.20 , color = "black")+
+    geom_boxplot(alpha = 0.75,aes(fill = regressor), outlier.shape = NA)+
+  labs(y = "Variance explained (%)", x = "", color = "Factor")+
+  theme_classic(base_size = 15)+
+  add_pvalue(p_value_table, y.position = seq(11.5, by = 1.5, length.out = nrow(p_value_table)),label ="p.adj", coord.flip = "TRUE" )+
+  coord_flip()+
+    scale_fill_manual(values = c("Age" = "#ffbe0b", "Breed Size" = "#fb5607", "Health Status" = "#ff006e", "Microbiome" = "#3a86ff","Sex" = "#8338ec", "Weight" = "#06A77D", "Diet" = "#98D2EB"))+
+      scale_color_manual(values = c("Age" = "#ffbe0b", "Breed Size" = "#fb5607", "Health Status" = "#ff006e", "Microbiome" = "#3a86ff","Sex" = "#8338ec", "Weight" = "#06A77D", "Diet" = "#98D2EB"))+
+  theme(legend.position = "none")
+
+```
+
+## Plot per feature varience explained
+```{r fig.width=8, fig.height=8}
+# Calculate per model and feature explainability
+model_exp <- var_exp_data%>%
+    filter(regressor %in% c("Microbiome", "Sex", "hs_general_health", "age_at_stool_collection", "breed_size_numeric","hs_general_health", "weight_from_vet_or_survey_lbs" , "diet_pc1", "diet_pc2", "diet_pc3", "diet_pc4"))%>%
+  mutate(SurveyText = str_remove(SurveyText, "Value"))%>%
+  # calculate total varience
+  group_by(SurveyText)%>%
+  mutate(total_var_exp = sum(mean_pctexp))%>%
+  ungroup()%>%
+  mutate(SurveyText = factor(SurveyText)%>%fct_reorder(total_var_exp ))%>%
+  # Change variable names
+  mutate(regressor = case_when(regressor == "hs_general_health" ~ "Health Status",
+                               regressor == "age_at_stool_collection" ~ "Age",
+                               regressor == "breed_size_numeric" ~ "Breed Size",
+                               regressor == "Microbiome" ~ "Microbiome",
+                               regressor == "Sex" ~ "Sex",
+                               regressor == "weight_from_vet_or_survey_lbs" ~ "Weight",
+                               regressor == "diet_pc1" | regressor == "diet_pc2" |regressor == "diet_pc3" |regressor == "diet_pc4"  ~ "Diet" ),
+         regressor = factor(regressor, levels = c("Weight", "Sex", "Health Status", "Breed Size","Age","Diet", "Microbiome" )))
+
+# Plot
+  ggplot(data=model_exp, aes(y=SurveyText, x=mean_pctexp)) +
+  geom_col( aes(fill = regressor),color = "black", alpha = 0.5) +
+  theme_classic(base_size = 15) +
+  labs( x =  "Mean variance explained (%)", fill = "Factor", y = "") +
+  theme(plot.title = element_text(hjust = 0.5))+
+  facet_grid(lab_test~., scales = "free", space = "free", switch="y")+
+  scale_fill_manual(values = c("Age" = "#ffbe0b", "Breed Size" = "#fb5607", "Health Status" = "#ff006e", "Microbiome" = "#3a86ff","Sex" = "#8338ec", "Weight" = "#06A77D", "Diet" = "#98D2EB"))
+
+```
+
+##Number of significant species with each lab test
+```{r}
+specie_urine_mix <- run_continuous_maaslin(ra_kraken_sp, 
+                 urine_lab_test%>%left_join(fixed_effect_data), 
+                 sample_id_column = 'sample_id', 
+                 metadata_cols_to_analyze = urine_numeric_columns, 
+                 fdr_threshold = 0.1,
+                 metadata_cols_fix_effects = FIXED,
+                 metadata_cols_rand_effects = RAND)
+
+kegg_pwys_urine_mix <- run_continuous_maaslin(kegg_pwys, 
+                 urine_lab_test%>%left_join(fixed_effect_data), 
+                 sample_id_column = 'sample_id', 
+                 metadata_cols_to_analyze = urine_numeric_columns, 
+                 fdr_threshold = 0.1,
+                 metadata_cols_fix_effects = FIXED,
+                 metadata_cols_rand_effects = RAND)
+
+kegg_pwys_cbc_mix <- run_continuous_maaslin(kegg_pwys, 
+                 cbc_lab_test%>%left_join(fixed_effect_data), 
+                 sample_id_column = 'sample_id', 
+                 metadata_cols_to_analyze = cbc_numeric_columns, 
+                 fdr_threshold = 0.1,
+                 metadata_cols_fix_effects = FIXED,
+                 metadata_cols_rand_effects = RAND)
+
+kegg_pwys_cp_mix <- run_continuous_maaslin(kegg_pwys, 
+                 cp_lab_test%>%left_join(fixed_effect_data), 
+                 sample_id_column = 'sample_id', 
+                 metadata_cols_to_analyze = cp_numeric_columns, 
+                 fdr_threshold = 0.1,
+                 metadata_cols_fix_effects = FIXED,
+                 metadata_cols_rand_effects = RAND)
+
+specie_cp_mix <- run_continuous_maaslin(ra_kraken_sp, 
+                 cp_lab_test%>%left_join(fixed_effect_data), 
+                 sample_id_column = 'sample_id', 
+                 metadata_cols_to_analyze = cp_numeric_columns, 
+                 fdr_threshold = 0.1,
+                 metadata_cols_fix_effects = FIXED,
+                 metadata_cols_rand_effects = RAND)
+
+specie_cbc_mix <- run_continuous_maaslin(ra_kraken_sp, 
+                 cbc_lab_test%>%left_join(fixed_effect_data), 
+                 sample_id_column = 'sample_id', 
+                 metadata_cols_to_analyze = cbc_numeric_columns, 
+                 fdr_threshold = 0.1,
+                 metadata_cols_fix_effects = FIXED,
+                 metadata_cols_rand_effects = RAND)
+
+
+
+# Combine results to a single table
+combined_mix_table <- bind_rows(as_tibble(specie_cp_mix$sig_results),
+                                as_tibble(specie_cbc_mix$sig_results), 
+                                as_tibble(kegg_pwys_cp_mix$sig_results), 
+                                as_tibble(kegg_pwys_cbc_mix$sig_results), 
+                                as_tibble(kegg_pwys_urine_mix$sig_results),
+                                as_tibble(specie_urine_mix$sig_results ))%>%
+  mutate(lab_test = case_when(metadata %in% cbc_numeric_columns ~ "CBC",
+                              metadata %in% cp_numeric_columns ~ "CP",
+                              metadata %in% urine_numeric_columns ~ "Urine"),
+         feature_type = case_when(feature %in% colnames(ra_kraken_sp) ~ "Species",
+                                  feature %in% colnames(kegg_pwys) ~ "Pathway"))%>%
+  filter(FDR<0.05)
+
+# Write SI table
+write_csv(combined_mix_table, "lab_test_and_species_associations.csv")
+```
+

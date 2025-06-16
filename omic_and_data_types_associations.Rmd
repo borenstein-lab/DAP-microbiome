@@ -1,0 +1,933 @@
+---
+title: "High-level associations between omics and measurement types"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+Here we aimed to assess the global associations between the dog gut microbiome and multiple technical and biological measurements available as part of the DAP. These measurement types included technical factors (such as sequencing batch and sequencing quality metrics), dog demographics, and lifestyle information as reported by dog owners. We additionally included complete blood counts (CBC) and genetic profiles (see Methods). A full list of measurement types and the features included within them is given in Supplementary Table S2. 
+
+Preparations:
+
+```{r message=FALSE, warning=FALSE}
+# Preparations
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(ape)
+library(cowplot)
+library(vegan)
+library(ecodist)
+library(stringr)
+library(foreach)
+library(variancePartition)
+library(PMA)
+library(glmnet)
+
+# Setup local cluster for parallel computing
+library(doSNOW)
+cl <- makeCluster(6)
+registerDoSNOW(cl)
+
+# Resolve possible conflicts
+library(conflicted)
+filter <- dplyr::filter
+select <- dplyr::select
+
+options(scipen = 999)
+set.seed(217)
+source('utils.R')
+
+# Paths
+metadata_dir <- '../data/metadata'
+terra_release <- 'terra_release_2023_12022024'
+dog_and_owner_csv <- file.path(metadata_dir, terra_release, "DAP_2023_HLES_dog_owner_v1.0.csv")
+metadata_codebook <- file.path(metadata_dir, terra_release, "DAP_2023_CODEBOOK_v1.0.csv")
+dap_breeds <- file.path(metadata_dir, terra_release, "DogAgingProject_GeneticData_CuratedRelease_2023.ancestry.tsv")
+dap_genetic_distance_matrix <- "../data/metadata/prec_grm.rds"
+dap_lab_tests <- file.path(metadata_dir, terra_release, "DAP_2023_SamplesResults_CBC_v1.0.csv")
+dir.create("omic_associations_backup")
+dir.create("Figure2")
+dir.create("SuppFigure2")
+
+# Mark whether all tests should be re-run, or whether previously-saved backup file can be used
+RECALCULATE_TESTS <- FALSE
+```
+
+## Load DAP profiles
+
+```{r DAP_DATA_LOADING, warning=FALSE, message=FALSE, cache = TRUE}
+source('../raw_shotgun_processing/load_batches_1-6.R') 
+```
+
+```{r, cache=TRUE}
+# Read metadata codebook
+codebook <- read_csv(metadata_codebook, show_col_types = FALSE, na = c('NA'))
+
+# Read main HLES table
+dog_and_owner <- read_csv(dog_and_owner_csv, show_col_types = FALSE, guess_max = 50000) %>%
+  rename(dap_dog_id = dog_id) %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  mutate(dap_dog_id = as.character(dap_dog_id))
+```
+
+***
+
+### Utility functions
+
+#### Plotting utils
+
+```{r}
+get_signif_marks <- function(ps) {
+  sapply(ps,
+         function(p) {
+           if (p<=0.005) return("***")
+           if (p<=0.01) return("**")
+           if (p<=0.05) return("*")
+           if (p<=0.1) return(".")
+           return("")
+         })
+}
+```
+
+```{r}
+# For Mantel/Procrustes
+plot_pairwise_shared_var <- function(df, title, effect_size_title, var_exp_cut = 5) {
+  df <- df %>% 
+    mutate(lbl = ifelse(
+      sign == "", "", 
+      paste0(sign,'\n',round(var_explained,1),'%')
+      ))
+  
+  # Push microbiome to top of the matrix
+  microb_dist <- grep("Microbiome", unique(df$dist_x_pretty), value = T)
+  dm_order <- rev(unique(c(
+    microb_dist[1], 
+    sort(unique(df$dist_x_pretty[! df$dist_x_pretty %in% microb_dist])),
+    microb_dist[2]
+    )))
+  df$dist_x_pretty <- factor(df$dist_x_pretty, levels = dm_order)
+  df$dist_y_pretty <- factor(df$dist_y_pretty, levels = dm_order)
+  
+  # So that extremely high associations are not overshadowing all else
+  df$var_explained <- pmin(var_exp_cut, df$var_explained)
+  
+  p <- ggplot(df %>%
+           filter(as.numeric(dist_x_pretty) <= as.numeric(dist_y_pretty)), 
+         aes(x = dist_x_pretty, y= dist_y_pretty, fill = var_explained)) +
+    geom_tile(color = "black", linewidth = 0.5, alpha = 0.6) +
+    geom_text(aes(label = lbl), color = "black", size = 2.6, lineheight = .7) +
+    geom_rect(xmin = 0.5, xmax = length(dm_order)-0.5, 
+              ymin = length(dm_order)-1.5, ymax = length(dm_order)-0.5, 
+              size = 0.8, color = 'black', alpha = 0) +
+    geom_rect(ymin = 0.5, ymax = length(dm_order)-0.5, 
+              xmin = 0.5, xmax = 1.5, 
+              size = 0.8, color = 'black', alpha = 0) +
+    theme_minimal(base_size = 13) +
+    labs(x = NULL, y = NULL) +
+    ggtitle(title) +
+    scale_x_discrete(position = "top") +
+    scale_fill_gradientn(colors = c('grey90','#afcb90',
+                                    '#8FB7B2','#707E9E',
+                                    '#4A618B','#2c497f',
+                                    '#3d2b56'),
+                         breaks = 0:var_exp_cut,
+                         labels = c(0:(var_exp_cut-1), paste0('>',var_exp_cut)),
+                         name = effect_size_title,  
+                         guide = guide_colorbar(frame.colour = "black", 
+                                                ticks.colour = "black")) +
+    theme(plot.title = element_text(hjust = 0.5, size = 14)) +
+    theme(panel.grid.major = element_blank()) +
+    theme(axis.text.x.top = element_text(angle = 45, hjust = 0)) +
+    theme(legend.position = c(.84, .23))
+  
+  return(p)
+}
+```
+
+#### Distance matrices
+
+```{r}
+get_dist_mat <- function(mat, dist_method = "euclidean") {
+  # For purely binary data
+  if (dist_method == 'binary') {
+    mat_dist <- dist(mat, method = 'binary') %>% as.matrix()
+  
+  # Euclidean distances
+  } else if (dist_method == 'euclidean') {
+    # Normalize variables
+    mat_centered <- scale(mat, center = TRUE, scale = TRUE)
+    # Calculate distances
+    mat_dist <- dist(mat_centered, method = dist_method) %>% as.matrix()
+  } else {
+    stop('Invalid distance metric')
+  }
+  return(mat_dist)
+}
+
+# Wrapper to above function that takes a data frame with sample ID's column as input
+get_dist_mat_from_df <- function(df, dist_method = "euclidean", sample_id_column = 'dap_dog_id') {
+  return(
+    df %>%
+      column_to_rownames(sample_id_column) %>%
+      as.matrix() %>%
+      get_dist_mat(dist_method = dist_method) %>%
+      as_tibble(rownames = sample_id_column, .name_repair = "minimal")
+  )
+}
+```
+
+```{r}
+get_categorical_dist <- function(feat_table, 
+                                 cat_column, 
+                                 sample_id_column = 'dap_dog_id') {
+  n_dogs <- nrow(feat_table)
+  cat_mat <- matrix(0, nrow = n_dogs, ncol = n_dogs)
+  for (i in 1:(n_dogs-1)) {
+    for (j in (i+1):n_dogs) {
+      if(feat_table[[cat_column]][i] != feat_table[[cat_column]][j]) {
+        cat_mat[i,j] <- 1
+        cat_mat[j,i] <- 1
+      }
+    }
+  }
+  rownames(cat_mat) <- feat_table[[sample_id_column]]
+  colnames(cat_mat) <- feat_table[[sample_id_column]]
+  cat_mat <- as.data.frame(cat_mat) %>% rownames_to_column(sample_id_column)
+  return(cat_mat)
+}
+```
+
+***
+
+### Data processing
+
+***
+
+#### Microbiome - taxonomy
+
+```{r}
+bc_dap_dog_id <- map_sample_id_to_dap_dog_id(bc, sample_map = sample_map)
+message('Done preparing bray-curtis distances')
+
+wuf_dap_dog_id <- map_sample_id_to_dap_dog_id(wuf, sample_map = sample_map)
+message('Done preparing weighted unifrac distances')
+
+shannon <- map_sample_id_to_dap_dog_id(shannon, sample_map = sample_map, rename_cols = FALSE)
+ra_kraken_sp <- map_sample_id_to_dap_dog_id(ra_kraken_sp, sample_map, rename_cols = F)
+ra_kraken_ge <- map_sample_id_to_dap_dog_id(ra_kraken_ge, sample_map, rename_cols = F)
+ra_kraken_ph <- map_sample_id_to_dap_dog_id(ra_kraken_ph, sample_map, rename_cols = F)
+```
+
+***
+
+#### Microbiome - function
+
+```{r}
+# Compute distance matrices based on MetaLAFFA functional profiles
+kegg_pwys <- map_sample_id_to_dap_dog_id(
+  kegg_pwys, 
+  sample_map = sample_map, 
+  rename_cols = FALSE)
+
+# Calculate distance matrices
+kegg_pwy_dist <- get_dist_mat_from_df(kegg_pwys)
+
+message('Done preparing functional data')
+```
+
+***
+
+#### Genetic data
+
+```{r}
+genetic_distance_matrix <- read_rds(dap_genetic_distance_matrix) %>%
+  get_genetic_distance_matrix() %>%
+  as.data.frame() 
+
+breed_data <- read_delim(
+  dap_genetic_matrix,
+  delim = "\t", 
+  escape_double = FALSE, 
+  trim_ws = TRUE,
+  show_col_types = FALSE
+  ) %>%
+  mutate(dog = as.character(dog)) %>%
+  mutate(pop = make.names(pop)) %>%
+  select(-code) %>%
+  # Remove rare breeds
+  group_by(pop) %>%
+  filter(n() >= 50) %>%
+  ungroup() %>%
+  # Convert to wide format
+  pivot_wider(id_cols = dog, names_from = pop, values_from = pct, values_fill = 0) %>%
+  rename(dap_dog_id = dog)
+
+message('Done preparing genetic data')
+```
+
+***
+
+#### Lab test data
+
+CBC only.
+
+```{r}
+# Read lab test codes
+lab_test_codes <- codebook %>%
+  filter(DataFile == "SamplesResults_CBC") %>%
+  filter(str_detect(Variable, "krt_cbc_") ) %>%
+  filter(!str_detect(Variable, "morph") ) %>%
+  filter(!str_detect(Variable, "comments") ) %>%
+  filter(!str_detect(Variable, "hemoparasites") ) %>%
+  filter(!str_detect(Variable, "plt_quant") ) %>%
+  pull(Variable)
+
+# Read and filter lab test results
+lab_test <- read_csv(dap_lab_tests, show_col_types = FALSE, na = c('NA')) %>%
+  # Filter dogs 
+  rename(dap_dog_id = dog_id ) %>%
+  mutate(dap_dog_id = as.character(dap_dog_id)) %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  # Precision 1 only
+  filter(Sample_Year == 'precision_1') %>%
+  # Take only numeric lab tests
+  select(all_of(c("dap_dog_id", lab_test_codes))) %>%
+  # Remove columns that have only zeros or NA
+  select_if(~ !all(is.na(.) | . == 0)) 
+
+# Remove columns with more than 20% NA's
+lab_test <- lab_test[, which(colMeans(is.na(lab_test)) < 0.2)]
+
+# Remove rows with missing data
+lab_test <- lab_test %>% drop_na()
+
+# Calculate distance matrices
+lab_test_dist <- get_dist_mat_from_df(lab_test)
+
+message('Done preparing lab test data')
+```
+
+***
+
+#### Dog overview - age, weight, sex [`dd`]
+
+```{r}
+# Age-only distance matrix
+age_data <- sample_map %>%
+  select(dap_dog_id, age_at_stool_collection)
+age_dist <- age_data %>%
+  get_dist_mat_from_df()
+
+# Weight-only distance matrix
+weight_data <- sample_map %>%
+  select(dap_dog_id, weight_from_vet_or_survey_lbs)
+weight_dist <- weight_data %>%
+  drop_na() %>%
+  get_dist_mat_from_df()
+
+# Sex-only distance matrix
+sex_data <- sample_map %>%
+  select(dap_dog_id, Sex_bool, Fixed_bool)
+sex_dist <- get_categorical_dist(dog_overview, "Sex_Class_at_HLES")
+```
+
+
+***
+
+#### Environment & lifestyle [`de`, `pa`]
+
+`de` = Dog Environment  
+`pa` = Physical Activity  
+
+```{r}
+env_codes <- c("de_recent_toxins_or_hazards_ingested_frequency", # Toxin exposure
+               "de_other_present_animals_dogs",                  # Household
+               "de_other_present_animals_cats",
+               "de_other_present_animals_wildlife",
+               "de_routine_hours_per_day_with_other_animals",
+               "de_routine_hours_per_day_with_children",
+               "de_routine_hours_per_day_with_adults",
+               "pa_cold_weather_months_per_year",                # Weather
+               "pa_hot_weather_months_per_year",                 
+               "de_property_area_accessible",                    # Property
+               "de_air_cleaner_present",                         # Air 
+               "de_air_freshener_present",
+               "de_hepa_present",
+               "de_home_area_type")
+
+pa_codes <- c("pa_avg_daily_active_hours",                       # PA
+              "pa_activity_level",                               
+              "pa_avg_activity_intensity",                       
+              "pa_on_leash_walk_frequency",
+              "pa_physical_games_frequency",
+              "de_stairs_in_home",
+              "de_routine_hours_per_day_in_yard",
+              "de_daytime_sleep_avg_hours",                      # Sleep
+              "de_nighttime_sleep_avg_hours")
+
+environment_data <- dog_and_owner %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  select(dap_dog_id, all_of(env_codes)) %>%
+  mutate(de_property_area_accessible = 
+           ifelse(is.na(de_property_area_accessible), 0, de_property_area_accessible)) %>%
+  mutate(de_other_present_animals_dogs = 
+           ifelse(de_other_present_animals_dogs == "TRUE", 1, 0)) %>%
+  mutate(de_other_present_animals_cats = 
+           ifelse(de_other_present_animals_cats == "TRUE", 1, 0)) %>%
+  mutate(de_other_present_animals_wildlife = 
+           ifelse(de_other_present_animals_wildlife == "TRUE", 1, 0)) %>%
+  mutate(de_air_cleaner_present = 
+           ifelse(de_air_cleaner_present == 1 | de_hepa_present == 1, 1, 0)) %>%
+  mutate(de_air_freshener_present = 
+           ifelse(de_air_freshener_present < 99, de_air_freshener_present, NA)) %>%
+  select(-de_hepa_present) %>%
+  mutate(de_routine_hours_per_day_with_other_animals = 
+           ifelse(de_routine_hours_per_day_with_other_animals == 97, 0.5,  de_routine_hours_per_day_with_other_animals)) %>%
+  mutate(de_routine_hours_per_day_with_children = 
+           ifelse(de_routine_hours_per_day_with_children == 97, 0.5,  de_routine_hours_per_day_with_children)) %>%
+  mutate(de_routine_hours_per_day_with_adults = 
+           ifelse(de_routine_hours_per_day_with_adults == 97, 0.5,  de_routine_hours_per_day_with_adults)) 
+  
+environment_dist <- environment_data %>%
+  drop_na() %>%
+  get_dist_mat_from_df()
+
+pa_data <- dog_and_owner %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  select(dap_dog_id, all_of(pa_codes)) %>%
+  mutate(de_stairs_in_home = 
+           ifelse(de_stairs_in_home == "TRUE", 1, 0)) %>%
+  mutate(de_routine_hours_per_day_in_yard = 
+           ifelse(de_routine_hours_per_day_in_yard == 97, 0.5,  de_routine_hours_per_day_in_yard)) %>%
+  mutate(de_daytime_sleep_avg_hours = 
+           ifelse(de_daytime_sleep_avg_hours < 99, de_daytime_sleep_avg_hours, NA)) %>%
+  mutate(de_nighttime_sleep_avg_hours = 
+           ifelse(de_nighttime_sleep_avg_hours < 99, de_nighttime_sleep_avg_hours, NA)) 
+
+pa_dist <- pa_data %>%
+  drop_na() %>%
+  get_dist_mat_from_df()
+
+message('Done preparing environment and physical activity data')
+```
+
+***
+
+#### Diet
+
+```{r}
+diet_codes <- c('df_appetite',
+                'df_feedings_per_day',
+                'df_primary_diet_component',
+                'df_treats_frequency',
+                "df_treats_homemade_protein",
+                "df_treats_homemade_biscuits",
+                "df_treats_bones",
+                "df_treats_peanut_butter", 
+                "df_treats_pumpkin", 
+                "df_treats_rawhide", 
+                "df_treats_table_carbs", 
+                "df_treats_table_meat", 
+                "df_treats_vegetables",
+                "df_treats_commercial_biscuits",
+                'de_drinking_water_is_filtered',
+                'de_eats_feces',
+                'de_eats_grass_frequency',
+                'df_primary_diet_component_grain_free',
+                'df_primary_diet_component_organic',
+                "de_drinks_outdoor_water",
+                # Only supplements given to at least 50 digs are included. NA's equal FALSE.
+                'df_daily_supplements_antiox',
+                'df_daily_supplements_chondroitin',
+                'df_daily_supplements_fiber',
+                'df_daily_supplements_glucosamine',
+                'df_daily_supplements_omega3',
+                'df_daily_supplements_probiotics',
+                'df_daily_supplements_vitamins')
+
+# Collect diet data
+diet_data <- dog_and_owner %>%
+  select(dap_dog_id, all_of(diet_codes)) %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  # Switch numbers so that order makes sense
+  mutate(de_eats_grass_frequency = ifelse(de_eats_grass_frequency > 0,
+                                          ifelse(de_eats_grass_frequency == 2, 1, 2),
+                                          0)) %>%
+  mutate(df_daily_supplements_antiox =      ifelse(is.na(df_daily_supplements_antiox)      | df_daily_supplements_antiox==0, 0, 1)) %>%
+  mutate(df_daily_supplements_chondroitin = ifelse(is.na(df_daily_supplements_chondroitin) | 
+                                                     df_daily_supplements_chondroitin==0, 0, 1)) %>%
+  mutate(df_daily_supplements_fiber =       ifelse(is.na(df_daily_supplements_fiber)       | df_daily_supplements_fiber==0, 0, 1)) %>%
+  mutate(df_daily_supplements_glucosamine = ifelse(is.na(df_daily_supplements_glucosamine) | 
+                                                     df_daily_supplements_glucosamine==0, 0, 1)) %>%
+  mutate(df_daily_supplements_omega3 =      ifelse(is.na(df_daily_supplements_omega3)      | df_daily_supplements_omega3==0, 0, 1)) %>%
+  mutate(df_daily_supplements_probiotics =  ifelse(is.na(df_daily_supplements_probiotics)  | 
+                                                     df_daily_supplements_probiotics==0, 0, 1)) %>%
+  mutate(df_daily_supplements_vitamins =    ifelse(is.na(df_daily_supplements_vitamins)    | 
+                                                     df_daily_supplements_vitamins==0, 0, 1)) %>%
+  mutate(df_treats_frequency = ifelse(df_treats_frequency == 4, 0.5, df_treats_frequency)) %>%
+  mutate(de_drinking_water_is_filtered = ifelse(de_drinking_water_is_filtered < 99, de_drinking_water_is_filtered, NA)) %>%
+  mutate(de_eats_feces = ifelse(de_eats_feces < 99, de_eats_feces, NA)) %>%
+  mutate(df_primary_diet_component_grain_free = ifelse(df_primary_diet_component_grain_free == "TRUE", 1, 0)) %>%
+  mutate(df_primary_diet_component_organic = ifelse(df_primary_diet_component_organic == "TRUE", 1, 0)) %>%
+  mutate(df_treats_bones = ifelse(df_treats_bones == "TRUE", 1, 0)) %>%
+  mutate(df_treats_pumpkin = ifelse(df_treats_pumpkin == "TRUE", 1, 0)) %>%
+  mutate(df_treats_peanut_butter = ifelse(df_treats_peanut_butter == "TRUE", 1, 0)) %>%
+  mutate(df_treats_rawhide = ifelse(df_treats_rawhide == "TRUE", 1, 0)) %>%
+  mutate(df_treats_table_carbs = ifelse(df_treats_table_carbs == "TRUE", 1, 0)) %>%
+  mutate(df_treats_table_meat = ifelse(df_treats_table_meat == "TRUE", 1, 0)) %>%
+  mutate(df_treats_vegetables = ifelse(df_treats_vegetables == "TRUE", 1, 0)) %>%
+  mutate(df_treats_commercial_biscuits = ifelse(df_treats_commercial_biscuits == "TRUE", 1, 0)) %>%
+  mutate(df_treats_homemade_protein = ifelse(df_treats_homemade_protein == "TRUE", 1, 0)) %>%
+  mutate(df_treats_homemade_biscuits = ifelse(df_treats_homemade_biscuits == "TRUE", 1, 0)) %>%
+  mutate(de_drinks_outdoor_water = ifelse(de_drinks_outdoor_water == "TRUE", 1, 0)) %>%
+  # Encode the different primary diets
+  mutate(value = 1) %>%
+  pivot_wider(names_from = "df_primary_diet_component", values_from = "value", values_fill = 0, names_prefix = 'primary_diet_') 
+
+# Drop primary diet categories that are pretty rare
+for (feat in grep('^primary_diet_', names(diet_data), value = T)) {
+  if (min(table(diet_data[[feat]])) < 30) {
+    message('Removed ', feat)
+    diet_data[[feat]] <- NULL
+  }
+}
+
+# Calculate diet distance matrix
+diet_dist <- diet_data %>%
+  drop_na() %>%
+  get_dist_mat_from_df()
+
+message('Done preparing diet data')
+```
+
+***
+
+#### Medications (currently only dental care and non-prescription-meds)
+
+```{r}
+med_codes <- c("mp_dental_brushing_frequency",
+               "mp_dental_treat_frequency",
+               "mp_flea_and_tick_treatment_oral",
+               "mp_heartworm_preventative_oral_chewable",
+               "mp_recent_non_prescription_meds_antihistamine",
+               "mp_recent_non_prescription_meds_anti_inflammatory",
+               "mp_recent_non_prescription_meds_upset_stomach")
+
+meds_data <- dog_and_owner %>%
+  select(dap_dog_id, all_of(med_codes)) %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  mutate(mp_flea_and_tick_treatment_oral = ifelse(is.na(mp_flea_and_tick_treatment_oral) | mp_flea_and_tick_treatment_oral == "FALSE", 0, 1)) %>%
+  mutate(mp_heartworm_preventative_oral_chewable = ifelse(is.na(mp_heartworm_preventative_oral_chewable) | mp_heartworm_preventative_oral_chewable == "FALSE", 0, 1)) %>%
+  mutate(mp_recent_non_prescription_meds_antihistamine = ifelse(mp_recent_non_prescription_meds_antihistamine == "TRUE", 1, 0)) %>%
+  mutate(mp_recent_non_prescription_meds_anti_inflammatory = ifelse(mp_recent_non_prescription_meds_anti_inflammatory == "TRUE", 1, 0)) %>%
+  mutate(mp_recent_non_prescription_meds_upset_stomach = ifelse(mp_recent_non_prescription_meds_upset_stomach == "TRUE", 1, 0)) 
+
+message('Done preparing medication data')
+```
+
+***
+
+#### Clinical conditions
+
+In the "dog and owner" table, each health category has an indication out of:
+(0) No disorder(s)  | (1) Only congenital disorder(s)  |  (2) Only non-congenital disorder(s)  |  (3) Both congenital and non-congenital disorder(s)
+
+For simplicity, we convert each category into a binary variable (0 = no condition, 1 = otherwise).
+
+```{r} 
+# Clinical conditions 
+clinical_data <- dog_and_owner %>%
+  select(dap_dog_id, starts_with('hs_health_conditions_'), 'hs_general_health') %>%
+  select(-hs_health_conditions_other) %>%
+  mutate(across(starts_with("hs_health_conditions_"), .fns = ~ case_when(.x == 0 ~ 0, TRUE ~ 1))) %>%
+  mutate(is_excellent_health = ifelse(hs_general_health==1, 1, 0)) %>%
+  select(-hs_general_health)
+
+clinical_dist <- clinical_data %>%
+  get_dist_mat_from_df(dist_method = 'binary')
+
+message('Done preparing clinical data (owner reported)')
+```
+
+***
+
+#### Technical variables
+
+Including:  
+
+* Pool   
+* Total reads - raw
+* Duplication rate
+* Q30 bases after quality control
+
+```{r}
+sample_qc_data <- qc_stats %>% 
+  filter(sample_id %in% sample_map$sample_id) %>%
+  select(sample_id, 
+         total_reads_before_filtering, 
+         duplication_rate,
+         q30_bases_rate_after_qc
+         ) %>%
+  # To reduce effect of outliers
+  mutate(total_reads_before_filtering = log10(total_reads_before_filtering))
+  
+sample_qc_data <- map_sample_id_to_dap_dog_id(
+  sample_qc_data, 
+  sample_map, 
+  rename_cols = F)
+
+# Distance matrix
+sample_qc_dist <- sample_qc_data %>%
+  drop_na() %>%
+  get_dist_mat_from_df()
+
+message('Done preparing techinical confounding data')
+```
+
+***
+
+#### Save
+
+Save an R object with the pre-processed data for use by other notebooks.
+
+```{r}
+# Organize main demographic variables 
+main_demographics <- sample_map %>%
+  select(dap_dog_id, 
+         age_at_stool_collection, 
+         life_stage_at_stool_collection, 
+         weight_from_vet_or_survey_lbs,
+         Sex_bool,
+         Fixed_bool,
+         Breed_status,
+         Breed,
+         breed_size) %>%
+  rename(Age = age_at_stool_collection) %>%
+  rename(Weight_lbs = weight_from_vet_or_survey_lbs) %>%
+  rename(Sex = Sex_bool) %>%
+  mutate(Fixed = Fixed_bool) 
+
+save(sample_map,
+     ra_kraken_sp,
+     ra_kraken_ge,
+     ra_kraken_ph,
+     kegg_pwys,
+     breed_data,
+     lab_test,
+     main_demographics,
+     pa_data,
+     environment_data,
+     sample_qc_data,
+     meds_data,
+     diet_data,
+     clinical_data,
+     file = 'backup_data.RData')
+```
+
+***
+
+# Pairwise associations - based on distance matrices
+
+## Organize all distance matrices 
+
+```{r}
+# List of distance matrices
+dist_names <- c("bc_dap_dog_id", 
+                "wuf_dap_dog_id",
+                "kegg_pwy_dist",
+                "age_dist", 
+                "weight_dist", 
+                "sex_dist", 
+                "genetic_distance_matrix", 
+                "lab_test_dist", 
+                "environment_dist", 
+                "pa_dist", 
+                "diet_dist",
+                "clinical_dist",
+                "sample_qc_dist"
+                ) 
+
+# Initialize grid for pairwise comparisons between distance matrices
+dist_list <- data.frame(dist = dist_names, num = 1:length(dist_names))
+comparison_grid <- cross_join(
+  x = dist_list %>% rename_with(function(x) paste0(x, '_x')), 
+  y = dist_list %>% rename_with(function(x) paste0(x, '_y'))
+  ) %>%
+  filter(num_x < num_y)
+
+# List of distance matrices
+dist_list <- lapply(dist_names, get)
+names(dist_list) <- dist_names
+
+# Pretty names for plots
+pretty_names <- c("bc_dap_dog_id" = "Microbiome - Tax'", 
+                  "wuf_dap_dog_id" = "Microbiome - WUF",
+                  "kegg_pwy_dist" = "Microbiome - Path'",
+                  "age_dist" = "Age", 
+                  "weight_dist" = "Weight", 
+                  "sex_dist" = "Sex", 
+                  "genetic_distance_matrix" = "Genotype", 
+                  "lab_test_dist" = "Blood tests",
+                  "environment_dist" = "Environment", 
+                  "pa_dist" = "Lifestyle",
+                  "diet_dist" = "Diet",
+                  "clinical_dist" = "Health conditions",
+                  "sample_qc_dist" = "Seq' quality")
+```
+
+```{r}
+n_perm <- 999
+pairwise_mantels_backup <- 'omic_associations_backup/pairwise_mantels.csv'
+pairwise_proc_backup <- 'omic_associations_backup/pairwise_protest.csv'
+
+# Set progress bar for foreach loops
+if (RECALCULATE_TESTS) {
+  pb <- txtProgressBar(max = nrow(comparison_grid), style = 3)
+  progress <- function(n) setTxtProgressBar(pb, n)
+  opts <- list(progress = progress)
+}
+```
+
+***
+
+## Mantel test
+
+We compare every pair of distance matrices using Mantel tests with 999 permutations. 
+The final effect size is given by Spearman's rho (^2).
+
+```{r}
+if (! RECALCULATE_TESTS) {
+  # Read from file
+  pairwise_mantels <- read_csv(pairwise_mantels_backup, show_col_types = F)
+} else {
+  # Calculate Mantel between pairs of distance matrices
+  pairwise_mantels <- foreach(i = 1:nrow(comparison_grid), 
+                    .combine = rbind, 
+                    .export = dist_names,
+                    .packages = c('dplyr','stringr','ggplot2'),
+                    .options.snow = opts) %dopar% {
+                      
+    # Get the two distances matrices to compare
+    .x = comparison_grid$dist_x[i]
+    .y = comparison_grid$dist_y[i]
+    message("Calculating mantel for ", .x, " <> ", .y)
+    dist_1 <- get(.x)
+    dist_2 <- get(.y)
+    
+    # Run mantel
+    mantel_result_spearman <- run_mantel_test(
+        dist_1, 
+        dist_2, 
+        sample_id_column = "dap_dog_id", 
+        corr_method = "spearman",
+        n_permutations = n_perm
+        )
+    
+    # Record result
+    mantel_result_spearman$results %>%
+      select(-n_shared_samples) %>%
+      rename(mantel_corr_spear = mantel_corr, p_value_spear = p_value) %>%
+      mutate(dist_x = .x, dist_y = .y) %>%
+      relocate(dist_x, dist_y)
+  }
+  
+  # Add some fields 
+  pairwise_mantels <- pairwise_mantels %>%
+    mutate(n_permutations = n_perm,
+           var_exp_spear = pmax(0, 100*(mantel_corr_spear^2)),
+           fdr_spear = p.adjust(p_value_spear, method = "fdr"))
+  
+  # Save 
+  write_csv(pairwise_mantels, 
+            file = pairwise_mantels_backup)
+}
+```
+
+```{r MANTEL_PLOT, fig.height=6.2, fig.width=7, message=F}
+# Organize data for plot
+# Flip X and Y to have both comparison directions
+tmp <- pairwise_mantels %>%
+  mutate(tmp = dist_x,
+         dist_x = dist_y,
+         dist_y = tmp) %>%
+  select(-tmp)
+
+mantel_for_plot <- bind_rows(pairwise_mantels, tmp) %>%
+  filter(dist_x %in% dist_names) %>%
+  filter(dist_y %in% dist_names) %>%
+  mutate(sign = get_signif_marks(fdr_spear),
+         dist_x_pretty = pretty_names[dist_x],
+         dist_y_pretty = pretty_names[dist_y]) %>%
+  rename(var_explained = var_exp_spear)
+
+# BC + KEGG
+p_mantel_bc <- plot_pairwise_shared_var(
+  mantel_for_plot %>% 
+    filter((! dist_x %in% c("wuf_dap_dog_id")) & 
+             (! dist_y %in% c("wuf_dap_dog_id"))),
+  title = 'Pairwise associations based on\nMantel tests',
+  effect_size_title = bquote('Mantel'~ rho^2~'(%)')
+)
+```
+
+***
+
+## Procrustes
+
+```{r}
+if (! RECALCULATE_TESTS) {
+  # Read from file
+  pairwise_protest <- read_csv(pairwise_proc_backup, show_col_types = F)
+} else {
+  pairwise_protest <- foreach(
+    i = 1:nrow(comparison_grid), 
+    .combine = rbind, 
+    .export = dist_names,
+    .packages = c('dplyr','ggplot2','tibble'),
+    .options.snow = opts) %dopar% {
+    
+    # Get the two distances matrices to compare
+    .x = comparison_grid$dist_x[i]
+    .y = comparison_grid$dist_y[i]
+    message("Calculating procrustes for ", .x, " <> ", .y)
+    dist_1 <- get(.x)
+    dist_2 <- get(.y)
+    
+    proc_result <- run_procrustes_test(
+      dist_1, 
+      dist_2, 
+      sample_id_column = "dap_dog_id", 
+      n_permutations = n_perm
+    )
+    
+    # Return results
+    proc_result$results %>% 
+      mutate(dist_x = .x, dist_y = .y) %>%
+      relocate(dist_x, dist_y)
+  }
+  
+  # Add some fields 
+  pairwise_protest <- pairwise_protest %>%
+    mutate(n_permutations = n_perm) %>%
+    mutate(fdr_p_value = p.adjust(p_value, method = "fdr")) 
+  
+  # Save 
+  write_csv(pairwise_protest, file = pairwise_proc_backup)
+}
+```
+
+```{r PROCRUSTES_PLOT, fig.height=6.2, fig.width=7}
+# Organize data for plot 
+tmp <- pairwise_protest %>%
+  mutate(tmp = dist_x,
+         dist_x = dist_y,
+         dist_y = tmp) %>%
+  select(-tmp)
+
+protest_for_plot <- bind_rows(pairwise_protest, tmp) %>%
+  filter(dist_x %in% dist_names) %>%
+  filter(dist_y %in% dist_names) %>%
+  mutate(sign = get_signif_marks(fdr_p_value),
+         dist_x_pretty = pretty_names[dist_x],
+         dist_y_pretty = pretty_names[dist_y]) %>%
+  mutate(var_explained = 100*var_explained)
+
+# BC
+p_protest_bc <- plot_pairwise_shared_var(
+  protest_for_plot %>% 
+    filter((! dist_x %in% c("wuf_dap_dog_id")) & 
+             (! dist_y %in% c("wuf_dap_dog_id"))),
+  title = 'Pairwise associations based on\nProcrustes tests',
+  effect_size_title = bquote('Procrustes'~r^2~'(%)')
+)
+
+# WUF
+p_protest_wuf <- plot_pairwise_shared_var(
+  protest_for_plot %>% 
+    filter((! dist_x %in% c("bc_dap_dog_id")) & 
+             (! dist_y %in% c("bc_dap_dog_id"))),
+  title = 'Pairwise associations based on\nProcrustes tests',
+  effect_size_title = bquote('Procrustes'~r^2~'(%)')
+)
+```
+
+## Main figure
+
+```{r fig.height=6, fig.width=6.2}
+p_mantel_bc
+ggsave(file="Figure2/Figure2C.svg", plot=p_mantel_bc, width=5.2, height=5.2)
+```
+
+## Supplementary figure
+
+```{r fig.height=6, fig.width=6.2}
+p_protest_bc
+ggsave(file="SuppFigure2/SuppFigure2A.svg", plot=p_protest_bc, width=5.2, height=5.2)
+```
+
+***
+
+# Multiple regression on distance matrices (MRM)
+
+## Measure omic importance by MRM permutation test p value
+
+The MRM method computes a p-value for each distance matrix included in the model, equivalent to a coefficient p-values in a linear model. Due to MRM's sensitivity to the ordering of the predictors, we evaluate these p-values across 100 random orderings.
+
+Note: Randomness is further introduced by the permutations within MRM (so not only ordering).
+
+```{r MRM_APPROACH2, message = FALSE}
+mrm2_backup <- 'omic_associations_backup/mrm_2_backup.RData'
+
+if (! RECALCULATE_TESTS) {
+  # Read from file
+  load(mrm2_backup)
+} else {
+
+  # BC
+  bc_mrm2_results <- run_multiple_MRM(
+    dist_list, 
+    response_matrix_name = "bc_dap_dog_id",
+    matrices_to_remove = c('wuf_dap_dog_id','kegg_pwy_dist'),
+    title = 'Coefficient p-value of each category in a MRM\n(BC)',
+    pretty_names
+    )
+  message('Completed MRM computation for BC distances')
+  
+  # WUF
+  wuf_mrm2_results <- run_multiple_MRM(
+    dist_list, 
+    response_matrix_name = "wuf_dap_dog_id",
+    matrices_to_remove = c('bc_dap_dog_id','kegg_pwy_dist'),
+    title = 'Coefficient p-value of each category in a MRM\n(WUF)',
+    pretty_names
+    )
+  message('Completed MRM computation for WUF distances')
+  
+  # KEGG
+  kegg_mrm2_results <- run_multiple_MRM(
+    dist_list,
+    response_matrix_name = "kegg_pwy_dist",
+    matrices_to_remove = c('wuf_dap_dog_id','bc_dap_dog_id'),
+    title = 'Coefficient p-value of each category in a MRM\n(KEGG pathways)',
+    pretty_names
+    )
+  message('Completed MRM computation for KEGG-PWY distances')
+  
+  save(bc_mrm2_results, 
+       wuf_mrm2_results, 
+       kegg_mrm2_results, 
+       file = mrm2_backup)
+}
+```
+
+```{r fig.width=5, fig.height=4}
+bc_mrm2_results$p
+wuf_mrm2_results$p
+kegg_mrm2_results$p
+ggsave(file="SuppFigure2/SuppFigure2B.svg", plot=bc_mrm2_results$p + ggtitle(NULL), width=5, height=3.3)
+```

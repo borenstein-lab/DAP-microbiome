@@ -1,0 +1,457 @@
+---
+title: "High-level associations between measurement types and specific species / alpha-diversity"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+In this notebook we explore whether certain bacterial species abundances were predictable using different types of available data. (For example: is there any specific species that can be well predicted given information about the dog's diet?). For this analysis only taxa with prevalence > 30% and a mean relative abundance > 0.05% were included. For each data type and each taxon, models were trained and evaluated using 5-fold cross validation, repeated 10 times. Spearman correlation was used to evaluate each model's performance on out-of-fold samples, comparing predicted relative abundances to true ones.
+
+*** 
+
+Preparations:
+
+```{r message=FALSE, warning=FALSE}
+# Preparations
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(ape)
+library(cowplot)
+library(vegan)
+library(ecodist)
+library(stringr)
+library(ranger)
+library(metap)
+library(rsample)
+library(glmnet)
+library(Matrix)
+library(scales)
+
+# Resolve possible conflicts
+library(conflicted)
+filter <- dplyr::filter
+select <- dplyr::select
+
+options(scipen = 999)
+source('utils.R')
+
+# Paths
+bac120_taxonomy_r207_tsv <- "../GTDB/release207/bac120_taxonomy_r207.tsv"
+ar53_taxonomy_r207_tsv <- "../GTDB/release207/ar53_taxonomy_r207.tsv"
+dir.create("supp_tables")
+```
+
+Load data: 
+
+```{r}
+source('../raw_shotgun_processing/load_batches_1-6.R') 
+```
+
+***
+
+## Load data
+
+Assumes that the "Data processing" section of the notebook `omic_and_data_type_associations.Rmd` was executed prior to running the below chunk.
+
+```{r}
+load('backup_data.RData')
+
+# Apply a stronger filtering of rare features
+prevalence_cutoff = 0.3
+avg_abundance_cutoff = 0.0005
+
+message('Removing rare phyla from Kraken tables')
+ra_kraken_ph <- remove_rare_features(
+  ra_kraken_ph, 
+  prevalence_cutoff=prevalence_cutoff,
+  avg_abundance_cutoff=avg_abundance_cutoff
+  )
+message('Removing rare genera from Kraken tables')
+ra_kraken_ge <- remove_rare_features(
+  ra_kraken_ge, 
+  prevalence_cutoff=prevalence_cutoff, 
+  avg_abundance_cutoff=avg_abundance_cutoff
+  )
+message('Removing rare species from Kraken tables')
+ra_kraken_sp <- remove_rare_features(
+  ra_kraken_sp, 
+  prevalence_cutoff=prevalence_cutoff,
+  avg_abundance_cutoff=avg_abundance_cutoff
+  )
+```
+
+Compute average abundances of each taxon:
+
+```{r}
+ph_abunds <- ra_kraken_ph %>%
+  tidyr::pivot_longer(cols = -dap_dog_id, names_to = 'ph', values_to = 'abun') %>%
+  select(-dap_dog_id) %>%
+  group_by(ph) %>%
+  summarise(mean_abun = mean(abun), prev = sum(abun>0)/n(), n_samples = n())
+
+ge_abunds <- ra_kraken_ge %>%
+  tidyr::pivot_longer(cols = -dap_dog_id, names_to = 'ge', values_to = 'abun') %>%
+  select(-dap_dog_id) %>%
+  group_by(ge) %>%
+  summarise(mean_abun = mean(abun), prev = sum(abun>0)/n(), n_samples = n())
+
+sp_abunds <- ra_kraken_sp %>%
+  tidyr::pivot_longer(cols = -dap_dog_id, names_to = 'sp', values_to = 'abun') %>%
+  select(-dap_dog_id) %>%
+  group_by(sp) %>%
+  summarise(mean_abun = mean(abun), prev = sum(abun>0)/n(), n_samples = n())
+```
+
+Measurement types used in this analysis:
+
+```{r}
+# Pretty names for plots
+pretty_names <- c("main_demographics" = 
+                  "Age, Weight,\nSex, Breed",
+                  "lab_test" = "Blood tests",
+                  "environment_data" = "Environment", 
+                  "pa_data" = "Lifestyle",
+                  "diet_data" = "Diet",
+                  "clinical_data" = "Health\nconditions",
+                  "sample_qc_data" = "Seq' quality")
+
+all_meas_types <- names(pretty_names)
+```
+
+Load a GTDB mapping file (to map each clade to higher-level taxonomic groups):
+
+```{r}
+bac120_taxonomy_r207 <- read_delim(
+  bac120_taxonomy_r207_tsv, 
+  delim = ";", 
+  escape_double = FALSE, 
+  col_names = c('ki','ph','cl','or','fa','ge','sp'), 
+  trim_ws = TRUE,
+  show_col_types = FALSE
+  ) %>% mutate(ki = 'Bacteria')
+
+ar53_taxonomy_r207 <- read_delim(
+  ar53_taxonomy_r207_tsv, 
+  delim = ";", 
+  escape_double = FALSE, 
+  col_names = c('ki','ph','cl','or','fa','ge','sp'), 
+  trim_ws = TRUE,
+  show_col_types = FALSE
+  ) %>% mutate(ki = 'Archaea')
+  
+gtdb_tax <- bind_rows(bac120_taxonomy_r207, ar53_taxonomy_r207) %>%
+  mutate(sp = gsub('^s__','',sp)) %>%
+  mutate(ge = gsub('^g__','',ge)) %>%
+  mutate(fa = gsub('^f__','',fa)) %>%
+  mutate(or = gsub('^o__','',or)) %>%
+  mutate(cl = gsub('^c__','',cl)) %>%
+  mutate(ph = gsub('^p__','',ph))
+
+tmp_fun <- function(x) { gsub('\\-| ', '\\.', x) }
+gtdb_tax <- gtdb_tax %>% mutate_all(tmp_fun)
+
+ge_to_ph <- gtdb_tax %>%
+  select(ge, ph) %>%
+  distinct()
+
+ge_abunds <- ge_abunds %>% left_join(ge_to_ph, by = 'ge')
+```
+
+***
+
+# Alpha-diversity predictability
+
+```{r}
+alpha <- map_sample_id_to_dap_dog_id(shannon, sample_map)
+```
+
+
+```{r}
+backup_file <- 'omic_associations_backup/alpha_preds_backup.csv'
+if (file.exists(backup_file)) {
+  message('Loading alpha-diversity modelling results from backup')
+  alpha_preds <- read_csv(backup_file, show_col_types = FALSE)
+} else {
+  # Initialize empty table
+  alpha_preds <- data.frame()
+  alpha_var_imp <- data.frame()
+  
+  # Iterate over each measurement type
+  for (curr_features in all_meas_types) {
+    message("Working on measurement-type: ", curr_features)
+    curr_features2 <- get(curr_features) %>% na.omit()
+    
+    # Train & evaluate RF models
+    tmp_res <- get_predictability_regression(
+      feat_table = curr_features2, 
+      metadata = alpha, 
+      sample_id_column = 'dap_dog_id', 
+      vars_to_analyze = c("shannon_sp"),
+      ml_method = 'rf',
+      corr_method = "spearman",
+      corr_threshold = 0.2,
+      n_ml_repeats = 10,
+      n_ml_folds = 5,
+      feat_importance = 'none',
+      rand_seed = 27
+      )
+    
+    # Record all results
+    alpha_preds <- bind_rows(
+      alpha_preds,
+      tmp_res$results %>% 
+        mutate(measurement_type = pretty_names[curr_features]) %>%
+        mutate(n_features_in_model = ncol(curr_features2)-1) %>%
+        select(-Significant)
+    )
+    message('----------------------------------')
+  } 
+  
+  # Re-calculate FDR
+  alpha_preds$new_fdr <- p.adjust(alpha_preds$p, method = 'fdr')
+  
+  # Save to avoid re-computing each time
+  write_csv(alpha_preds, file = backup_file)
+}
+```
+
+```{r fig.width=5, fig.height=4}
+get_signif_mark <- function(x) {if(x<0.001) return('***'); if(x<0.01) return('**'); if(x<0.05) return('*'); if(x<0.1) return('.'); return('')}
+
+tmp <- alpha_preds %>%
+  filter(measure == 'shannon_sp') %>%
+  arrange(mean_cor)
+tmp$label <- sapply(tmp$new_fdr, FUN = get_signif_mark)
+tmp$measurement_type <- factor(tmp$measurement_type, levels = rev(tmp$measurement_type))
+
+ggplot(tmp, aes(x = measurement_type, y = mean_cor, fill = mean_cor, label = label)) +
+  geom_col(color = 'black', width = 0.6) +
+  geom_text(vjust = 0) +
+  scale_fill_gradient(name = 'Correlation r', low = 'grey90', high = 'orchid4') +
+  scale_y_continuous(expand=expansion(mult=c(0,0.1))) +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  xlab(NULL) +
+  ylab('Model performance\n(Correlation between observed\nand predicted alpha diversity)') +
+  ggtitle('Potential determinants of shannon diversity') +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.position = 'none')
+
+```
+
+***
+
+# Genera predictability 
+
+```{r}
+# Take 20 top abundant genera only
+top_abundant_genera <- ge_abunds %>%
+  top_n(n = 20, wt = mean_abun) %>%
+  arrange(-mean_abun)
+```
+
+
+```{r}
+backup_file <- 'omic_associations_backup/all_tax_preds_backup.csv'
+if (file.exists(backup_file)) {
+  message('Loading modelling results from backup')
+  all_tax_preds <- read_csv(backup_file, show_col_types = FALSE)
+} else {
+  # Initialize empty table
+  all_tax_preds <- data.frame()
+  
+  # Iterate over each measurement type
+  for (curr_features in all_meas_types) {
+    message("Working on measurement-type: ", curr_features)
+    
+    # Pull data
+    curr_features_df <- get(curr_features) %>% na.omit()
+    
+    # Train & evaluate RF models
+    tmp_res <- get_predictability_regression(
+      feat_table = curr_features_df, 
+      metadata = ra_kraken_ge, 
+      sample_id_column = 'dap_dog_id', 
+      vars_to_analyze = top_abundant_genera$ge,
+      ml_method = 'rf',
+      corr_method = "spearman",
+      corr_threshold = 0.2,
+      n_ml_repeats = 10,
+      n_ml_folds = 5,
+      rand_seed = 27
+      )
+    
+    # Record all results
+    all_tax_preds <- bind_rows(
+      all_tax_preds,
+      tmp_res$results %>% 
+        mutate(taxa_level = 'ge') %>%
+        mutate(measurement_type = pretty_names[curr_features]) %>%
+        mutate(n_features_in_model = ncol(curr_features_df)-1) %>%
+        select(-Significant)
+    )
+    message('----------------------------------')
+  } 
+  
+  # Re-calculate FDR
+  all_tax_preds$new_fdr <- p.adjust(all_tax_preds$p, method = 'fdr')
+  
+  # Add phyla
+  all_tax_preds <- all_tax_preds %>% left_join(ge_to_ph, by = c('measure'='ge'))
+  
+  # Save to avoid re-computing each time
+  write_csv(all_tax_preds, file = backup_file)
+}
+```
+      
+## Plot
+
+```{r fig.width=7, fig.height=4.5}
+fdr_threshold_grey_out <- 0.05
+cor_thres_grey_out <- 0
+
+# Merge both genera predictions and shannon diversity predictions
+tmp1 <- all_tax_preds %>%
+  filter(taxa_level == 'ge') %>%
+  select(measure, measurement_type, new_fdr, mean_cor, ph) 
+
+tmp2 <- alpha_preds %>%
+  filter(measure == 'shannon_sp') %>%
+  mutate(measure = 'Shannon diversity') %>%
+  select(measure, measurement_type, new_fdr, mean_cor) %>%
+  mutate(ph = '')
+
+tmp <- bind_rows(tmp1, tmp2)
+# Add significant marks
+tmp$label <- sapply(tmp$new_fdr, FUN = get_signif_mark)
+
+# Define abbreviations for phyla names
+ph_abbrev <- c('Actinobacteriota'='Ac.',
+               'Campylobacterota'='Cam.',
+               'Firmicutes_C'='Fir.C',
+               'Fusobacteriota'='Fus.',
+               #'Firmicutes_A'='Firm._A',
+               'Firmicutes'='Fir.',
+               'Proteobacteria'='Pro.')
+
+# Plot
+p_abunds <- ggplot(
+  ge_abunds %>%
+    filter(ge %in% top_abundant_genera$ge) %>%
+    # Use abbreviations
+    mutate(ph = ifelse(ph %in% names(ph_abbrev), ph_abbrev[ph], ph)) %>%
+    # Just in order to align correctly to the graph below
+    bind_rows(data.frame(ge = 'Shannon diversity', ph = '', mean_abun = 0)), 
+                   aes(x = ge, y = mean_abun)) +
+  geom_col(color = 'black', width = 0.8) +
+  ylab('Mean relative\nabundance') +
+  xlab(NULL) +
+  theme_minimal() +
+  facet_grid(~ph, scales = 'free', space = 'free') +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(axis.text.x = element_blank()) +
+  #theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  theme(plot.margin = unit(c(5, 5, 0, 5), "points")) +
+  theme(strip.text = element_blank())
+
+p_grid <- ggplot(
+  tmp %>%
+    # Only top abundant species
+    filter(measure %in% top_abundant_genera$ge | measure == 'Shannon diversity') %>%
+    # Use abbreviations
+    mutate(ph = ifelse(ph %in% names(ph_abbrev), ph_abbrev[ph], ph)) %>%
+    # Grey out FDR's above a threshold
+    mutate(mean_cor = ifelse(
+      new_fdr <= fdr_threshold_grey_out & 
+        mean_cor >= cor_thres_grey_out, 
+      mean_cor, NA
+      )), 
+    aes(x = measure, 
+        y = measurement_type, 
+        fill = mean_cor,
+        label = label
+        )) +
+  geom_tile(linewidth = 1.1, linejoin = 'mitre', color = 'white') +
+  geom_text(size = 3) +
+  scale_fill_gradientn(
+    name = expression(rho),  #'Rho',
+    na.value = 'grey90',
+    colors = c('white','#F5E8B7','#CD5C08','darkred'),
+    limits = c(cor_thres_grey_out - 0.01, NA),
+    breaks = c(0,0.05,0.1,0.15,0.2,0.25,0.3,0.35),
+    guide = guide_colorbar(
+      frame.colour = "black", 
+      ticks.colour = "black"
+      )) +
+  scale_alpha_manual(values = 1, labels = 
+                       paste('FDR >', fdr_threshold_grey_out)) +
+  xlab(NULL) +
+  ylab(NULL) +
+  theme_minimal() +
+  facet_grid(~ph, scales = 'free', space = 'free', switch = 'x') +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  theme(legend.margin = margin(-0.3,0,0,0, unit="cm")) +
+  theme(plot.margin = unit(c(0, 5, 0, 5), "points")) +
+  theme(strip.placement = "outside") +
+  theme(strip.text = element_text(face='bold', color='darkred')) +
+  theme(legend.key.width= unit(0.3, 'cm'))
+
+p <- plot_grid(p_abunds, p_grid, 
+          ncol = 1, 
+          rel_heights = c(2,5), 
+          align = 'v', axis = 'lr')
+p
+```
+
+```{r}
+ggsave(file="Figure2/Figure2D.svg", plot=p, width=7.5, height=4.5)
+```
+
+
+## Supplementary Tables
+
+### S1: Average taxa abundances
+
+Note: only taxa with a prevalence over 30% are included here
+
+```{r}
+bind_rows(
+  ph_abunds %>% rename(Taxon = ph) %>% mutate(tax_level = 'Phylum'),
+  ge_abunds %>% rename(Taxon = ge) %>% mutate(tax_level = 'Genus') %>% select(-ph),
+  sp_abunds %>% rename(Taxon = sp) %>% mutate(tax_level = 'Species'),
+) %>%
+  mutate(mean_abun = round(mean_abun, 5)) %>%
+  mutate(prev = round(prev, 5)) %>%
+  relocate(tax_level, Taxon, n_samples) %>%
+  rename(`Taxonomic rank` = tax_level) %>%
+  rename(`Average abundance` = mean_abun) %>%
+  rename(`Prevalence` = prev) %>%
+  rename(`Total number of samples analyzed` = n_samples) %>%
+  write_csv('supp_tables/s1_taxa_average_abundances.csv')
+```
+
+### S5: Genera + alpha-diversity predictions based on different measurment types
+
+```{r}
+tmp %>%
+  mutate(mean_cor = round(mean_cor, 5)) %>%
+  mutate(new_fdr = round(new_fdr, 8)) %>%
+  mutate(measurement_type = gsub('\n',' ',measurement_type)) %>%
+  select(measure, measurement_type, mean_cor, new_fdr) %>%
+  rename(`Feature predicted (genus abundance / alpha-diversity)` = measure) %>%
+  rename(`Data type used as predictors` = measurement_type) %>%
+  rename(`Spearman correlation - predicted vs. real (mean over folds)` = mean_cor) %>%
+  rename(FDR = new_fdr) %>%
+  write_csv('supp_tables/s5_genera_predictions.csv')
+```
+
+
+
+         

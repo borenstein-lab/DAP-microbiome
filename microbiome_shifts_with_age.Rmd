@@ -1,0 +1,854 @@
+---
+title: "DAP dogs' microbiome shifts with age"
+author: "Borenstein Lab"
+date: "April 2025"
+output:
+  html_document:
+    css: custom_notebook_formatting.css
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+---
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = 'center')
+```
+
+Here we present the analysis that was performed to identify the association between the microbiome and age in dogs. The analysis was performed on the data from the Terra release 2023_12022024, and includes samples from 6 batches of dogs. The analysis includes both alpha and beta diversity, uniqueness, as well as differential abundance analysis and machine learning models to predict age based on microbiome features.
+The analysis is Figure 3 in the paper (and also Figure 4C).
+
+# Preparations
+
+```{r message=FALSE, warning=FALSE}
+# Preparations
+library(readr)
+library(ggplot2)
+library(ggridges)
+library(gridExtra)
+library(tibble)
+library(ggpubr)
+library(tidyr)
+library(dplyr)
+library(themis)
+library(ape)
+library(cowplot)
+library(vegan)
+library(kableExtra)
+library(stringr)
+library(recipes)
+library(ROSE)
+library(combinat)
+library(lightgbm)
+library(caret)
+library(ranger)
+library(randomForest)
+library(tidymodels)
+options(scipen = 999)
+source('../raw_shotgun_processing/load_batches_1-6.R') 
+```
+
+## Read Terra data
+
+```{r}
+
+# Read HLES data
+dog_and_owner <- read_csv(file.path(metadata_dir, "terra_release_2023_12022024", "DAP_2023_HLES_dog_owner_v1.0.csv"),
+                         show_col_types = FALSE,
+                         guess_max = 50000) %>%
+  rename(dap_dog_id = dog_id) %>%
+  mutate(dap_dog_id = as.character(dap_dog_id))
+
+# Merge the sample_,ap and the HLES data
+sample_map <- sample_map %>%
+  inner_join(dog_and_owner, by="dap_dog_id")
+
+# Add total_reads_before_filtering from qc_stats
+sample_map <- sample_map %>% inner_join(qc_stats %>% select(sample_id, total_reads_before_filtering, duplication_rate), by="sample_id")
+
+sample_map <- sample_map %>%
+  filter(Breed_Size_Class_at_HLES != "Insufficient information to classify")
+
+# Define the metadata columns to be used in the analysis as fixed effects and random effect
+FIXED <- c("breed_size_numeric", "Sex_class", "total_reads_before_filtering", "duplication_rate", "hs_general_health", "weight_from_vet_or_survey_lbs") 
+RANDOM <- c("pool") 
+
+```
+
+# Section 1: general aging-microbiome trends
+
+## Age vs. alpha and beta-diversity
+
+### Alpha diversity
+
+Mixed effect model: age \~ alpha diversity + constant fixed effects
+
+```{r fig.height=5,  fig.width=4, message=FALSE, warning=FALSE}
+
+print("Get fixed effect model with shannon diversity")
+alpha_div <- shannon %>% select(sample_id, shannon_sp)
+res <- get_mixed_effect(alpha_div, 
+                             sample_map, 
+                             sample_id_column = 'sample_id', 
+                             metadata_cols_to_analyze = c("age_at_stool_collection") , 
+                             fdr_threshold = 0.05,
+                             fixed_cols = FIXED,
+                             random_cols = RANDOM)
+
+res$plots # Figure  3A
+
+```
+
+### Beta diversity
+
+```{r fig.height=3, fig.width=5, message=FALSE, warning=FALSE}
+
+
+res <- get_distance_from_reference_group(
+                      tmp_sample_map, 
+                      bc, 
+                      "Bray_Curtis",
+                      metadata_col_to_analyze = "new_life_stage_at_stool_collection", 
+                      reference_group_in_col = "Reference group young Adult",
+                      sample_id_column = 'sample_id', 
+                      metadata_cols_fix_effects = FIXED,
+                      metadata_cols_random_effects = RANDOM,
+                      fdr_threshold = 0.05,
+                      colors = list("Young Adult" = "#F4A582",  "Mature Adult" = "#92C5DE", "Senior" = "#0571B0"),
+                      ord = c("Young Adult", "Mature Adult", "Senior"))
+print(res$plot + 
+        labs(x = "Life state at stool collection") +
+        labs(y = "Mean distance from young adults") +
+        labs(title = paste(names(distances_dfs)[[i]])))
+print(res$regression_results)
+print(res$wilcoxon_resuls)
+
+
+
+p <- res$plot + # Figure 3B
+      labs(x = "Life state at stool collection") +
+      labs(y = "Mean distance from young adults") 
+
+
+
+```
+
+
+```{r fig.height=10, fig.width=12, message=FALSE, warning=FALSE}
+
+pcoa_values_list <- list()
+res_list <- list()
+
+
+res <- get_permanova(disct_metadata = sample_map %>% filter(!is.na(weight_from_vet_or_survey_lbs)),
+              dist_matrix = bc,
+              dist_metric_name = "Bray_Curtis",
+              sample_id_column = 'sample_id',
+              metadata_cols_to_analyze = c("life_stage_at_stool_collection"),
+              metadata_cols_fix_effects = c(RANDOM, FIXED),
+              fdr_threshold = 0.1,
+              ord=c("Puppy", "Young Adult", "Mature Adult", "Senior"),
+              pcoa_fill = list("Puppy" = "#CA0020", "Young Adult" = "#F4A582",  "Mature Adult" = "#92C5DE", "Senior" = "#0571B0"),
+              add_centroid=TRUE,
+              level=0.9
+              )
+p_threshold <- 0.05
+results <- res$results
+significant_res <- results[results$pvals < p_threshold, ]
+if (dim(significant_res)[1] > 0){
+  print(paste0('The following tests resulted in p-value < ', p_threshold, ":"))
+  print(significant_res)
+  p <- plot_grid(plotlist = res$plots, ncol = 2, nrow = 2, align = 'hv', axis = 'tblr')
+  title <- ggdraw() + draw_label("PCoA of Permanova significant results", fontface='bold')
+  print(plot_grid(title, p, ncol=1, rel_heights=c(0.1, 1)))
+} else {
+  print("No significat results to plot.")
+}
+
+```
+
+Plot PCoA with age distribution:
+
+```{r fig.height=5, fig.width=5.5, message=FALSE, warning=FALSE}
+
+tmp_pcoa_values <- res$pcoa_values
+
+# Get the pcoa plot
+p_pcoa <- res_list$Bray_Curtis$plots$`life_stage_at_stool_collection_pc1&pc2` +
+  labs(subtitle = NULL, title = NULL)
+
+leg <- as_ggplot(get_legend(p_pcoa))
+
+# Plot the pcoa with age distribution
+p_pcoa <- p_pcoa + 
+  theme(legend.title = element_blank()) +
+  theme(legend.position = c(0.885,0.885)) +
+  theme(legend.background = element_rect(fill = "transparent")) +
+  scale_fill_manual(values = list("Puppy" = "#CA0020", "Young Adult" = "#F4A582",  "Mature Adult" = "#92C5DE", "Senior" = "#0571B0"))
+
+# Determine the x and y axis limits
+xmin <- layer_scales(p_pcoa)$x$range$range[[1]]
+xmax <- layer_scales(p_pcoa)$x$range$range[[2]]
+ymin <- layer_scales(p_pcoa)$y$range$range[[1]]
+ymax <- layer_scales(p_pcoa)$y$range$range[[2]]
+
+# Set the number of bins and calculate the mean age for each bin
+number_of_bins1 <- 50
+
+# Set the number of bins and calculate the mean age for each bin
+jumps1 <- (xmax - xmin) / number_of_bins1
+df_mean_1 <- data.frame(bin = character(), mean_age = numeric())
+for (i in 1:number_of_bins1){
+  mean_age <- tmp_pcoa_values %>%
+    select(Axis.1, age_at_stool_collection)  %>%
+    filter(Axis.1 >= xmin + jumps1*(i-1) & Axis.1 < xmin + jumps1*i) %>%
+    summarise(mean_age = mean(age_at_stool_collection, na.rm = TRUE))
+  df_mean_1 <- rbind(df_mean_1, data.frame(bin=xmin+jumps1*(i-0.5),  mean_age = mean_age))
+}
+
+# Plot the mean age distribution of the 2nd axis
+p_dis_1 <- ggplot(df_mean_1, aes(x = bin, y = mean_age)) +
+  geom_bar(stat = "identity", fill = "#e0e1dd",  color = "grey70", alpha  = 0.2) +
+   geom_smooth(data=df_mean_1,
+              aes(x = bin, y = mean_age),
+              method = "lm", se= FALSE, color = "firebrick4", size = 1) +
+  xlab(NULL)+
+  ylab("Mean age") +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  xlim(xmin, xmax) 
+
+#  Plot the mean age distribution of the 1st axis
+number_of_bins2 <- 50
+jumps2 <- (ymax - ymin) / number_of_bins2
+df_mean_2 <- data.frame(bin = character(), mean_age = numeric())
+for (i in 1:number_of_bins2){
+  mean_age <- tmp_pcoa_values %>%
+    select(Axis.2, age_at_stool_collection)  %>%
+    filter(Axis.2 >= ymin + jumps2*(i-1) & Axis.2 < ymin + jumps2*i) %>%
+    summarise(mean_age = mean(age_at_stool_collection, na.rm = TRUE))
+  df_mean_2 <- rbind(df_mean_2, data.frame(bin=ymin+jumps2*(i-0.5),  mean_age = mean_age))
+}
+p_dis_2 <- ggplot(df_mean_2, aes(x = bin, y = mean_age)) +
+  geom_bar(stat = "identity", fill = "#e0e1dd", color = "grey70", alpha  = 0.2) +
+  geom_smooth(data=df_mean_2,
+              aes(x = bin, y = mean_age),
+              method = "lm", se= FALSE, color = "firebrick4", size = 1) +
+  xlab(NULL) +
+  ylab("Mean age") +
+  scale_y_continuous(expand = c(0,0)) +
+  theme_classic() +
+  # theme(plot.margin = margin(0, 0, 0, 0)) +
+  theme(axis.ticks.y = element_blank(),
+        axis.text.y = element_blank()) +
+  coord_flip() +
+  xlim(ymin, ymax) 
+
+
+# Create the final plot
+p_left <- plot_grid(p_dis_1, p_pcoa, nrow = 2, rel_heights = c(0.7,4), align = 'v')
+p_right <- plot_grid(NULL, p_dis_2, nrow = 2, rel_heights = c(0.7,4))
+p <- plot_grid(p_left, p_right, ncol = 2, rel_widths = c(4,0.7))
+
+p # Figure 3C
+```
+
+
+#### Uniqueness
+
+```{r fig.height=2.5, fig.width=2, message=FALSE, warning=FALSE}
+
+
+min_non_zero <- function(x) {
+  min_val <- min(x[x > 0], na.rm = TRUE)
+  ifelse(is.infinite(min_val), NA, min_val)
+}
+
+
+# Apply the function across rows to get the minimal non-zero value for each row
+uni <- bc %>%
+  rowwise() %>%
+  mutate(uniqueness = min_non_zero(c_across(-sample_id)))
+
+# Select only the sample_id and uniqueness columns to create the new dataframe
+uni <- select(uni, sample_id, uniqueness)
+
+res <- get_mixed_effect(uni, 
+                        sample_map %>% filter(!is.na(weight_from_vet_or_survey_lbs)), 
+                        sample_id_column = 'sample_id', 
+                        metadata_cols_to_analyze = c("age_at_stool_collection") , 
+                        fdr_threshold = 0.05,
+                        fixed_cols = FIXED,
+                        random_cols = RANDOM)
+if (length(res$plots) > 0){
+  print(res$plots[[1]] + labs(subtitle = str_replace(res$plots[[1]]$label$subtitle, "FDR", "p-value"))  )
+} else {
+  print("No significant correlations to plot.")
+}
+  
+res$plots[[1]] + # Figure 3D
+  labs(subtitle = str_replace(res$plots[[1]]$label$subtitle, "FDR", "p-value")) + 
+  labs(title = names(distances_dfs)[[i]])
+  
+
+```
+
+# Section 2: specific species shifts - aging markers
+
+```{r fig.height=4, fig.width=5.5, message=FALSE, warning=FALSE}
+
+res <- run_continuous_maaslin(feat_table = ra_kraken_sp,
+                                metadata =  sample_map %>% 
+                                 filter(!is.na(weight_from_vet_or_survey_lbs)) %>%  
+                                 mutate(breed_size_numeric = as.numeric(breed_size_numeric)), 
+                                sample_id_column = 'sample_id', 
+                                metadata_cols_to_analyze = c("age_at_stool_collection"), 
+                                metadata_cols_fix_effects = c(FIXED),
+                                metadata_cols_rand_effects = RANDOM,
+                                fdr_threshold = 0.05,
+                                output_dir = "da",
+                                transformation_method = "LOG",
+                                keep_maaslin_plots = FALSE,
+                                category_name_map=NULL,
+                                logscale_y = TRUE,
+                                return_maaslin_plots = FALSE)
+
+# Load the GTDB taxonomy to get the genus and phylum per each species
+gtdb <- samples_metadata <- read_tsv(
+  file.path(metadata_dir, "gtdb", "bac120_taxonomy_r207.tsv"),show_col_types = FALSE, col_names=FALSE) %>%
+  rename(taxonomy = X2) %>%   
+  separate(taxonomy, into = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";") %>%
+  mutate(
+    Domain = sub("d__", "", Domain),
+    Phylum = sub("p__", "", Phylum),
+    Class = sub("c__", "", Class),
+    Order = sub("o__", "", Order),
+    Family = sub("f__", "", Family),
+    Genus = sub("g__", "", Genus),
+    Species = sub("s__", "", Species)
+  )
+
+# Plot species with significant association with age
+p <- res$all_results %>%
+  filter(value == "age_at_stool_collection") %>%
+  mutate(Genus = str_extract(feature, "^[^.]+")) %>%
+  left_join(gtdb %>% select(Genus, Phylum) %>% distinct(), by = "Genus") %>%
+    mutate(Genus = case_when(
+    Genus %in% c("Prevotella", "Holdemanella") ~ Genus,
+    TRUE ~ "other"
+  )) %>%
+  ggplot(aes(x = coef, y = -log(FDR), fill=Genus, color=Genus)) +
+  geom_point( alpha = 0.7, shape = 21, size = 2.5) +
+  geom_hline(yintercept = -log(0.05), linetype = "dashed", color = "red") +  
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey") + 
+  labs(x = "Regression coefficient", y = "-log(FDR)") +  # Axis labels
+  # Color specific genus
+  scale_fill_manual(values = c("Prevotella" = "#f7b267",  "Holdemanella" = "#c9184a", "other" = "grey80"), 
+                    breaks = c("Prevotella", "Holdemanella", "C")) +
+  scale_color_manual(values = c("Prevotella" = "grey20",  "Holdemanella" = "grey20", "other" = "grey20"),
+                     breaks = c("Prevotella", "Holdemanella", "C")) +
+  theme_classic()
+
+p # Figure 3E
+```
+
+# Section 3: predict age based on microbiome features
+
+```{r}
+get_predictability_regression_for_age_pred <- function(feat_table, 
+                                                       metadata, 
+                                                       sample_id_column, 
+                                                       vars_to_analyze, 
+                                                       ml_method = 'rf',
+                                                       fdr_threshold = 0.1,
+                                                       corr_threshold = 0.3,
+                                                       corr_method = "pearson",
+                                                       n_ml_repeats = 10,
+                                                       n_ml_folds = 5,
+                                                       feat_importance = 'none',
+                                                       rand_seed = 1111,
+                                                       quiet = FALSE) {
+  # Required libraries loading
+  require(rsample)
+  require(dplyr)
+  require(glmnet)
+  require(ranger)
+  require(metap) 
+  
+  # Argument validations 
+  if(! all(vars_to_analyze %in% names(metadata)))
+    stop("Invalid 'vars_to_analyze' argument. Some of the variables provided are missing from the metadata table")
+  if(is.null(vars_to_analyze))
+    stop("Invalid 'vars_to_analyze' argument. Cannot be NULL")
+  if(! ml_method %in% c('rf'))
+    stop("Invalid 'ml_method' argument. Only 'rf' supported.")
+  if (! corr_method %in% c('pearson', 'spearman'))
+    stop("Invalid 'corr_method' argument. Only 'pearson' and 'spearman' supported.")
+  
+  # Main calculations
+  n_samples <- nrow(feat_table)
+  
+  # Generate folds for cross-validation
+  set.seed(rand_seed)
+  folds <- vfold_cv(
+    data.frame(sample_num = 1:n_samples),
+    v = n_ml_folds,
+    repeats = n_ml_repeats
+  )
+  
+  # Collect evaluation stats here
+  cv_correlations <- data.frame()
+  cv_feat_imp <- data.frame()
+  
+  # Fix names of features (causes errors in some models)
+  names(feat_table) <- make.names(names(feat_table))
+  
+  # Iterate over variables
+  for (measure in vars_to_analyze) {
+    if (!quiet) message("Training model for variable: ", measure)
+    
+    # Prepare temporary table for training (features + label only)
+    tmp <- feat_table %>% 
+      left_join(
+        metadata[,c(sample_id_column, measure)] %>% 
+          rename(Label = 2), 
+        by = sample_id_column)
+
+    pred_per_fold_list <- list()
+    
+    # Cross validation loop
+    for (i in 1:nrow(folds)) {
+      fold_id <- paste(folds$splits[[i]]$id, collapse = " ")
+      
+      # Get train/test samples of this fold
+      train_samples <- folds$splits[[i]]$in_id
+      train_data <- tmp[train_samples,] %>% filter(!is.na(Label))
+      test_data <- tmp[-train_samples,] %>% filter(!is.na(Label))
+      
+      test_data_with_sample_id <- test_data
+      train_data <- train_data %>%
+        select(-any_of(c(sample_id_column)))
+      test_data <- test_data %>%
+        select(-any_of(c(sample_id_column)))
+      
+      # Train RF
+      rf_model <- ranger(Label ~ ., data = train_data, importance = ifelse(feat_importance=='altmann','permutation','none'), seed = rand_seed)
+      if (feat_importance != 'none') {
+        feat_imp <- importance_pvalues(rf_model, method="altmann", formula = Label ~ ., data = train_data, seed = rand_seed)
+      }
+      
+      # Make prediction on held out samples
+      preds <- predict(rf_model, test_data %>% select(-Label))$predictions
+      
+      
+      # Calculate model performance for this fold
+      tmp_eval <- data.frame(preds = preds, true_label = test_data$Label, sample_id = test_data_with_sample_id$sample_id)  
+      
+      pred_per_fold_list[[i]] <- tmp_eval
+      
+      cv_correlations <- bind_rows(
+        cv_correlations,
+        data.frame(
+          measure = measure,
+          fold_id = fold_id,
+          test_cor = cor(tmp_eval$preds, tmp_eval$true_label, method = corr_method),
+          test_cor_p = cor.test(tmp_eval$preds, 
+                                tmp_eval$true_label, 
+                                alternative = 'greater', # Check positive association
+                                method = corr_method,
+                                exact = FALSE)$p.value
+        )
+      )
+      
+      if (feat_importance != 'none')
+        cv_feat_imp <- bind_rows(
+          cv_feat_imp,
+          as.data.frame(feat_imp) %>% 
+            tibble::rownames_to_column('feature') %>%
+            mutate(measure = measure, fold_id = fold_id)
+        )
+    }
+  }
+  
+  sumlog2 <- function(ps) {ps <- ps[!is.na(ps)]; return(sumlog(ps)$p)}
+  
+  # Summarise over folds
+  summary_correlations <- cv_correlations %>%
+    group_by(measure) %>%
+    summarise(n_folds = n(),
+              mean_cor = mean(test_cor, na.rm = TRUE),
+              sd_cor = sd(test_cor, na.rm = TRUE),
+              p = sumlog2(test_cor_p),
+              .groups = "drop") %>%
+    mutate(fdr = p.adjust(p)) %>%
+    mutate(Significant = fdr < fdr_threshold & mean_cor > corr_threshold)
+  
+  # Summarize feature importance (if requested by user)
+  summary_feat_importance <- data.frame()
+  if (feat_importance != 'none')
+    summary_feat_importance <- cv_feat_imp %>%
+      group_by(measure, feature) %>%
+      summarise(n_folds = n(),
+                mean_feat_importance = mean(importance, na.rm = TRUE),
+                sd_feat_importance = sd(importance, na.rm = TRUE),
+                p = sumlog2(pvalue),
+                .groups = "drop") %>%
+      mutate(fdr = p.adjust(p))
+  
+  if (! any(summary_correlations$Significant)) {
+    message('No significantly well-predicted metadata measures')
+  } else {
+    message('The following measures were well-predicted by the microbiome using a ', toupper(ml_method), ' model:')
+    message(paste(summary_correlations$measure[summary_correlations$Significant], collapse = ', '))
+  }
+  
+  return(list(results = summary_correlations, feat_importance = summary_feat_importance, cv_cor=cv_correlations, fold_preds=pred_per_fold_list))
+}
+
+```
+
+Train the model with microbiome features + confounders and only confounders:
+
+```{r}
+
+PRED_FIXED <- c("breed_size_numeric", "Sex_bool", "pool", "total_reads_before_filtering",
+                "duplication_rate", "weight_from_vet_or_survey_lbs")
+
+# microbiome features + confounders
+
+tmp_sample_map <- sample_map %>% 
+  filter(!is.na(weight_from_vet_or_survey_lbs))  %>%
+  filter(!is.na(breed_size_numeric))  %>%
+  filter(hs_general_health %in% c(1,2)) %>%
+  mutate(Sex_bool = case_when(
+    grepl("Female", Sex_class) ~ "female",
+    grepl("Male", Sex_class) ~ "male",
+    TRUE ~ Sex_class # This is a catch-all in case there are unexpected values
+  ))
+
+tmp_ra_kraken_sp <- ra_kraken_sp %>% 
+  inner_join(tmp_sample_map %>% select(PRED_FIXED, sample_id), by="sample_id") 
+
+rf_res_mic <- get_predictability_regression_for_age_pred(tmp_ra_kraken_sp, 
+                                                         tmp_sample_map, 
+                                                         "sample_id", 
+                                                         "age_at_stool_collection", 
+                                                         ml_method = 'rf',
+                                                         fdr_threshold = 1,
+                                                         corr_threshold = 0,
+                                                         corr_method = "pearson",
+                                                         n_ml_repeats = 1, 
+                                                         n_ml_folds = 10, 
+                                                         feat_importance = 'none',
+                                                         rand_seed = 84,
+                                                         quiet = FALSE)
+
+# only confounders
+
+confounders <- tmp_sample_map %>% select(sample_id, PRED_FIXED) %>%
+  mutate(breed_size_numeric = as.numeric(breed_size_numeric))
+
+rf_res_con <- get_predictability_regression3(confounders, 
+                                          tmp_sample_map, 
+                                          "sample_id", 
+                                          "age_at_stool_collection", 
+                                          ml_method = 'rf',
+                                          fdr_threshold = 1,
+                                          corr_threshold = 0,
+                                          corr_method = "pearson",
+                                          n_ml_repeats = 1, 
+                                          n_ml_folds = 10, 
+                                          feat_importance = 'none',
+                                          rand_seed = 84,
+                                          quiet = FALSE)
+
+
+final_df_mic <- do.call(rbind, lapply(seq_along(rf_res_mic$fold_preds), function(i) {
+  df <- rf_res_mic$fold_preds[[i]]
+  df$index <- i
+  df$data <- "microbiome + confounders"
+  return(df)
+}))
+
+final_df_con <- do.call(rbind, lapply(seq_along(rf_res_con$fold_preds), function(i) {
+  df <- rf_res_con$fold_preds[[i]]
+  df$index <- i
+  df$data <- "confounders"
+  return(df)
+}))
+
+merged_df <- rbind(final_df_mic, final_df_con)
+
+```
+
+Plot the results of the models:
+
+```{r fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+library(ggpmisc)
+
+# Calculate correlations per facet
+correlations <- merged_df %>%
+  filter(data == "microbiome + confounders") %>%
+  group_by(index) %>%
+  summarize(correlation = cor(true_label, preds)) %>%
+  mutate(data="microbiome + confounders")
+correlations2 <- merged_df %>%
+  filter(data == "confounders") %>%
+  group_by(index) %>%
+  summarize(correlation = cor(true_label, preds)) %>%
+  mutate(data="confounders")
+
+merged_correlations <- rbind(correlations, correlations2)
+
+p <- ggplot(merged_correlations, aes(x = data, y = correlation)) +
+  geom_boxplot(aes(fill=data), alpha=0.5, show.legend = FALSE) +
+  geom_point(size=2.5, alpha=0.5) + #, aes(color=as.factor(index))
+  labs(x = "Training data", y = "Perason correlation") + # , color = "Fold"
+  # scale_color_manual(values = c("#012a4a", "#013a63", "#01497c", "#014f86", "#2a6f97", "#2c7da0", "#468faf", "#61a5c2", "#89c2d9", "#a9d6e5")) +
+  scale_fill_manual(values = c("#b5e48c", "#89c2d9")) +
+  theme_classic() +
+  theme(
+    panel.grid.major = element_line(color = "lightgray", size = 0.25),  # Major grid lines
+    panel.grid.minor = element_line(color = "lightgray", size = 0.25),  # Minor grid lines
+    panel.grid.major.x = element_blank(),  # Remove vertical grid lines
+    panel.grid.minor.x = element_blank(),  # Remove minor vertical grid lines
+  ) +
+  scale_x_discrete(labels = c("microbiome + confounders" = "Microbiome + confounders", "confounders" = "Confounders"))  # Manually set x-axis labels
+
+print(p) # Figure 3G
+
+```
+
+Plot the correlation between the real and predicted age per fold (for the model that used microbiome features + confounders):
+
+```{r fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+# Load necessary packages
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+
+data <- merged_df %>% filter(data == "microbiome + confounders")
+
+# Calculate Spearman correlations for each index
+correlations <- data %>%
+  group_by(index) %>%
+  summarize(correlation = cor(true_label, preds, method = "pearson")) %>%
+  mutate(label = paste(index))#, ": Pearson r =", round(correlation, 3)))
+
+# Convert correlations to a named vector for legend labels
+legend_labels <- setNames(correlations$label, as.character(correlations$index))
+
+# Create the scatter plot with regression lines
+p <- ggplot(data, aes(x = true_label, y = preds)) +
+  geom_point(size=1.25, alpha=0.3) +
+  geom_smooth(aes(color = as.factor(index)), method = "lm", se = FALSE, size=0.5, alpha=0.3) +
+  labs(color = "Fold") +
+  xlab("Real age") +
+  ylab("Predicted age") +
+  scale_color_manual(values = c("#012a4a", "#013a63", "#01497c", "#014f86", "#2a6f97", "#2c7da0", "#468faf", "#61a5c2", "#89c2d9", "#a9d6e5"), 
+                     labels = legend_labels) +
+  theme_classic()
+
+# Display the plot
+print(p) # Figure 3F
+
+```
+
+Import clinical lab tests
+
+```{r}
+
+# Import CBC lab test
+cbc_lab_test <- read_csv(file.path(metadata_dir,"terra_release_2023_12022024","DAP_2023_SamplesResults_CBC_v1.0.csv"), 
+                         show_col_types = FALSE, na = c('NA'))%>%
+  # filter to precision 1 dogs with metagenomics
+  filter(Sample_Year == "precision_1")%>%
+  rename(dap_dog_id = dog_id )%>%
+  mutate(dap_dog_id = as.character(dap_dog_id))%>%
+  # filter non-numeric and NA columns 
+  select(where(~ !all(is.na(.))))%>%
+  select(-c(krt_cbc_abs_bands, krt_cbc_pcv, krt_cbc_plt_quant, krt_cbc_plt_morph, krt_cbc_plt_morph_num, krt_cbc_rbc_morph, krt_cbc_rbc_morph_2, krt_cbc_rbc_morph_3, krt_cbc_rbc_morph_num, krt_cbc_rbc_morph_num_2, krt_cbc_wbc_morph, krt_cbc_wbc_morph_num, krt_cbc_hemoparasites, krt_cbc_test_comments, krt_cbc_abs_metamyelocytes, krt_cbc_abs_other_cells, krt_cbc_rel_metamyelocytes, krt_cbc_rel_bands, krt_cbc_rel_basophils, "krt_cbc_pct","krt_cbc_plt_morph_2", "krt_cbc_plt_morph_num_2", "krt_cbc_nucleated_rbcs" , "krt_cbc_rbc_morph_num_3"))%>%   select(-matches("krt_cbc_rel*"))%>%
+  # add metagenomic sample id
+  left_join(select(sample_map, sample_id, dap_dog_id))%>%
+  
+cbc_numeric_columns <- cbc_lab_test %>%
+  select_if(is.numeric) %>%
+  names()
+
+# Import CP lab test
+cp_lab_test <- read_csv(file.path(metadata_dir,"terra_release_2023_12022024","DAP_2023_SamplesResults_ChemistryPanel_v1.0.csv"), show_col_types = FALSE, na = c('NA'))%>%
+  # filter to precision 1 dogs with metagenomics
+  filter(Sample_Year == "precision_1")%>%
+  rename(dap_dog_id = dog_id )%>%
+  mutate(dap_dog_id = as.character(dap_dog_id))%>%
+  select(where(~ !all(is.na(.))))%>%
+  select(-krt_cp_test_comments)%>%
+  # add metagenomic sample id
+  left_join(select(sample_map, sample_id, dap_dog_id))%>%
+  
+cp_numeric_columns <- cp_lab_test %>%
+  select_if(is.numeric) %>%
+  names()
+
+#Import urine lab test - mostly char
+urine_lab_test <- read_csv(file.path(metadata_dir,"terra_release_2023_12022024","DAP_2023_SamplesResults_Urine_v1.0.csv"), show_col_types = FALSE, na = c('NA'))%>%
+  filter(Sample_Year == "precision_1")%>%
+  rename(dap_dog_id = dog_id )%>%
+  # filter(dap_dog_id %in% dap_id_subset$dap_dog_id)%>%
+  mutate(dap_dog_id = as.character(dap_dog_id))%>%
+  left_join(select(sample_map, sample_id, dap_dog_id))
+
+```
+
+
+```{r fig.height=7, fig.width=4, message=FALSE, warning=FALSE}
+
+library(effectsize)
+
+lab_test_results <- cbc_lab_test %>% select(sample_id, all_of(cbc_numeric_columns)) %>% drop_na(sample_id) %>% 
+  inner_join(cp_lab_test %>% select(sample_id, all_of(cp_numeric_columns)) %>% drop_na(sample_id), by="sample_id") %>% 
+  inner_join(urine_lab_test %>% 
+               select(sample_id, krt_urine_ph, krt_urine_sg) %>% # 
+               drop_na(sample_id) %>%
+               mutate(krt_urine_sg = ifelse(krt_urine_sg == ">1.060", "1.060", krt_urine_sg)) %>%
+               mutate(krt_urine_sg = as.numeric(krt_urine_sg)), by="sample_id") # %>%
+
+# Impute missing values with half of the minimum value in the column
+replace_na_with_half_min <- function(column) {
+  min_val <- min(column, na.rm = TRUE)
+  column[is.na(column)] <- min_val / 2
+  return(column)
+}
+
+# Apply the function to each column in the data frame
+lab_test_results <- lab_test_results %>%   mutate(across(where(is.numeric), replace_na_with_half_min))
+
+model <- lm(preds ~ true_label, data = final_df_mic)
+residuals <- resid(lm(preds ~ true_label, data = final_df_mic))
+
+residuals_df <- final_df_mic %>%
+  mutate(residuals = resid(lm(preds ~ true_label, data = final_df_mic))) %>%
+  inner_join(lab_test_results, by="sample_id") 
+  
+regressors <- lab_test_results %>% select (-sample_id) %>% colnames()
+
+final_pctexp <- data.frame("regressor" = c(sort(regressors)))
+formula_string <- paste("residuals", "~", paste(regressors, collapse = " + "))
+model <- lm(formula = as.formula(formula_string), data = residuals_df)
+an <- car::Anova(model, type = 2)
+andf <- data.frame(regressor = rownames(an), pval = an$"Pr(>F)", ss=an$"Sum Sq") %>% filter(regressor != "Residuals")
+e <- eta_squared(an, partial = TRUE) # partial = TRUE is the default
+residuals_df <- data.frame(regressor = e$Parameter, pctexp = e$Eta2_partial) 
+
+residuals_df <- residuals_df %>% 
+  mutate(regressor = factor(residuals_df$regressor, levels=regressors)) %>%
+  separate(regressor, into = c("krt", "lab_test_category"), sep = "_", remove = FALSE) %>%
+  select(-krt) %>%
+  inner_join(andf, by="regressor") %>%
+  mutate(pctexp = if_else(is.na(pctexp), 0, pctexp)) %>%
+  mutate(fdr = p.adjust(pval, method = "fdr")) %>%
+  mutate(significance = ifelse(fdr < 0.1, "*", "")) %>%
+  left_join(codebook, by = c("regressor" = "Variable")) %>%
+  mutate(SurveyText = str_replace(SurveyText, " Value", "")) %>%
+  mutate(lab_test_category = case_when(
+    lab_test_category == "cbc" ~ "Complete blood count",
+    lab_test_category == "cp" ~ "Chemistry profile",
+    lab_test_category == "urine" ~ "Urine",
+    TRUE ~ lab_test_category  # Keeps any other values unchanged
+  ))
+
+
+```
+
+```{r fig.height=7, fig.width=9, message=FALSE, warning=FALSE}
+
+library(effectsize)
+
+lab_test_results <- cbc_lab_test %>% select(sample_id, all_of(cbc_numeric_columns)) %>% drop_na(sample_id) %>% 
+  inner_join(cp_lab_test %>% select(sample_id, all_of(cp_numeric_columns)) %>% drop_na(sample_id), by="sample_id") %>% 
+  inner_join(urine_lab_test %>% 
+               select(sample_id, krt_urine_ph, krt_urine_sg) %>% # 
+               drop_na(sample_id) %>%
+               mutate(krt_urine_sg = ifelse(krt_urine_sg == ">1.060", "1.060", krt_urine_sg)) %>%
+               mutate(krt_urine_sg = as.numeric(krt_urine_sg)), by="sample_id") # %>%
+  # select(-krt_cbc_total_wbcs)
+
+
+# Impute missing values with half of the minimum value in the column
+replace_na_with_half_min <- function(column) {
+  min_val <- min(column, na.rm = TRUE)
+  column[is.na(column)] <- min_val / 2
+  return(column)
+}
+
+# Apply the function to each column in the data frame
+lab_test_results <- lab_test_results %>%   mutate(across(where(is.numeric), replace_na_with_half_min))
+
+age_df <- sample_map %>% 
+  select(sample_id, age_at_stool_collection) %>% 
+  inner_join(lab_test_results, by="sample_id") 
+
+regressors <- lab_test_results %>% select (-sample_id) %>% colnames()
+
+final_pctexp <- data.frame("regressor" = c(sort(regressors)))
+formula_string <- paste("age_at_stool_collection", "~", paste(regressors, collapse = " + "))
+model <- lm(formula = as.formula(formula_string), data = age_df)
+an <- car::Anova(model, type = 2)
+andf <- data.frame(regressor = rownames(an), pval = an$"Pr(>F)", ss=an$"Sum Sq") %>% filter(regressor != "Residuals")
+e <- eta_squared(an, partial = TRUE) # partial = TRUE is the default
+real_age_df <- data.frame(regressor = e$Parameter, pctexp = e$Eta2_partial) 
+
+
+real_age_df <- real_age_df %>% 
+  mutate(regressor = factor(real_age_df$regressor, levels=regressors)) %>%
+  separate(regressor, into = c("krt", "lab_test_category"), sep = "_", remove = FALSE) %>%
+  select(-krt) %>%
+  inner_join(andf, by="regressor") %>%
+  mutate(pctexp = if_else(is.na(pctexp), 0, pctexp)) %>%
+  mutate(fdr = p.adjust(pval, method = "fdr")) %>%
+  mutate(significance = ifelse(fdr < 0.05, "*", "")) %>%
+  left_join(codebook, by = c("regressor" = "Variable")) %>%
+  mutate(SurveyText = str_replace(SurveyText, " Value", "")) %>%
+  mutate(lab_test_category = case_when(
+    lab_test_category == "cbc" ~ "Complete blood count",
+    lab_test_category == "cp" ~ "Chemistry profile",
+    lab_test_category == "urine" ~ "Urine",
+    TRUE ~ lab_test_category  # Keeps any other values unchanged
+  ))
+
+real_age_df <- residuals_df %>%
+  mutate(param = "Metagenomic clock residuals") %>%
+  rbind(real_age_df %>% mutate(param = "Age")) %>%
+  mutate(lab_test_category = case_when(
+      lab_test_category %in% c("cbc", "cp") ~ toupper(lab_test_category),
+      lab_test_category == "urine" ~ "Urine",
+      TRUE ~ lab_test_category  # Keep unchanged if none of the conditions match
+    )) 
+
+# Arrange the data by regressor order where param == "age"
+real_age_df_ordered <- real_age_df %>%
+  filter(param == "Age") %>%
+  arrange(pctexp)  # Arrange by pctexp in descending order for example
+
+
+p <- ggplot(data = real_age_df %>% mutate(pctexp = pctexp), aes(y = pctexp, x = factor(SurveyText, levels = real_age_df_ordered$SurveyText), fill = lab_test_category)) +
+  geom_bar(stat = "identity", alpha=0.7, color="black") +
+  theme_classic() +
+  geom_text(data=real_age_df,aes(y = pctexp + 0.001, x = factor(SurveyText, levels = edf2_ordered$SurveyText), label = significance)) +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1), legend.position = "none") +  # Adjust angle as needed
+  ylab("Percentage explained (age)") +
+  xlab("Regressor") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  coord_flip() +
+  scale_fill_manual(values = list("Complete blood count" = "#f95738", "Chemistry profile" = "#ee964b", "Urine" = "#f4d35e")) +
+  facet_grid(lab_test_category ~factor(param, levels=c('Age', 'Metagenomic clock residuals')), scales = "free", space = "free", switch = "y") +
+  scale_y_continuous(trans = "reverse") # Reverse the y-axis
+
+
+print(p) # Figure 4C
+
+```
+ 

@@ -1,0 +1,267 @@
+---
+title: "DAP dogs' Precision 1 cohort description"
+author: "Borenstein Lab"
+date: "April 2025"
+output:
+  html_document:
+    css: custom_notebook_formatting.css
+    toc: true
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+---
+
+In this file we describe the dogs in the DAP Precision 1 cohort and generate Figure 1.
+The data is from the Terra release 2023_12022024.
+
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = 'center')
+```
+
+# Import libraries
+
+```{r message=FALSE, warning=FALSE}
+# Preparations
+library(readr)
+library(ggplot2)
+library(ggridges)
+library(gridExtra)
+library(tibble)
+library(ggpubr)
+library(tidyr)
+library(dplyr)
+library(themis)
+library(ape)
+library(cowplot)
+library(vegan)
+library(kableExtra)
+library(stringr)
+library(recipes)
+library(ROSE)
+library(forcats)
+library(combinat)
+library(lightgbm)
+library(caret)
+library(ranger)
+library(randomForest)
+library(tidymodels)
+options(scipen = 999)
+source('../raw_shotgun_processing/load_batches_1-6.R') 
+```
+
+# Load data
+
+```{r}
+dog_and_owner <- read_csv(file.path(metadata_dir, "terra_release_2023_12022024", "DAP_2023_HLES_dog_owner_v1.0.csv"),
+                         show_col_types = FALSE,
+                         guess_max = 50000) %>%
+  rename(dap_dog_id = dog_id) %>%
+  mutate(dap_dog_id = as.character(dap_dog_id))
+
+# Merge the sample_,ap and the HLES datça
+sample_map <- sample_map %>%
+  inner_join(dog_and_owner, by="dap_dog_id")
+```
+
+Plot the number of dogs per state
+
+```{r}
+
+library(usmap)
+states_map <- us_map()
+
+country_counts <- sample_map %>%
+  group_by(dd_acquired_state) %>%
+  summarise(count = n())
+
+map_data <- states_map %>%
+  left_join(country_counts, by = c("abbr" = "dd_acquired_state"))
+
+p <- ggplot(map_data) +
+  geom_sf(aes(fill = count)) +
+  scale_fill_viridis_c(direction = -1, option = "F", begin=0.3, name="Dogs", na.value = "white") +
+  theme_classic() +
+  theme(
+    axis.title = element_blank(),       # Remove axis titles
+    axis.text = element_blank(),        # Remove axis text
+    axis.ticks = element_blank(),       # Remove axis ticks
+    axis.line = element_blank(),        # Remove axis lines
+    panel.grid = element_blank(),       # Remove grid lines (optional)
+    axis.title.y = element_blank()      # Specifically remove y-axis title (if needed)
+  )
+
+p # Figure 1A
+```
+
+
+Plot the age distribution by age
+
+```{r, fig.width=5, fig.height=3}
+p <- sample_map %>%
+  mutate(Sex = case_when(
+    grepl("Female", Sex_class, ignore.case = TRUE) ~ "Female",
+    grepl("Male", Sex_class, ignore.case = TRUE) ~ "Male"
+  )) %>%
+  ggplot(aes(x = age_at_stool_collection, fill=Sex)) +
+  geom_density(alpha=0.5) +
+  theme_classic() +
+  xlab("Age (at stool collection)") +
+  ylab("Density") +
+  scale_fill_manual(values = c("#da9f93", "#7ca982")) +
+  theme(
+    legend.position = c(0.7, 1),            # Position legend inside plot, upper-left
+    legend.justification = c(0, 1),           # Anchor legend by upper-left corner
+    legend.background = element_rect(fill = "white", color = NA),  # Optional: white background for better visibility
+    axis.text = element_text(size = 14),    # Enlarge axis text
+    axis.title = element_text(size = 16),   # Enlarge axis titles
+    legend.text = element_text(size = 12),  # Enlarge legend text
+    legend.title = element_text(size = 14)  # Enlarge legend title
+  )
+
+p # Figure 1B
+```
+
+Plot the sex distribution (including intact/sterilized)
+
+```{r, fig.width=6, fig.height=3.5}
+p <- sample_map %>%
+  mutate(Sex = case_when(
+    grepl("Female", Sex_class, ignore.case = TRUE) ~ "Female",
+    grepl("Male", Sex_class, ignore.case = TRUE) ~ "Male"
+  )) %>%
+  mutate(Sterilized = case_when(
+    grepl("intact", Sex_class, ignore.case = TRUE) ~ "intact",
+    TRUE ~ "sterilized"
+  )) %>%
+  ggplot(aes(x = Sex, fill=Sex_class)) +
+  scale_fill_manual(values = c("#ebd4cb", "#da9f93", "#e0eec6", "#7ca982"), name="Sterilization status") +
+  geom_bar(alpha=1, color="black") +
+  xlab("Sex") +
+  ylab("Dogs") +
+  theme_classic()  +
+  theme(
+    axis.text = element_text(size = 14),    # Enlarge axis text
+    axis.title = element_text(size = 16),   # Enlarge axis titles
+    legend.text = element_text(size = 12),  # Enlarge legend text
+    legend.title = element_text(size = 14)  # Enlarge legend title
+  )
+
+p # Figure 1C
+```
+
+Plot the breed distribution of the top 10 most common breeds
+
+```{r, fig.width=4, fig.height=4}
+
+
+breed_data <- read_delim(
+  file.path(metadata_dir, terra_release, "DogAgingProject_GeneticData_CuratedRelease_2023.ancestry.tsv"),
+  delim = "\t", 
+  escape_double = FALSE, 
+  trim_ws = TRUE,
+  show_col_types = FALSE
+  ) %>%
+  mutate(dog = as.character(dog)) %>%
+  mutate(pop = make.names(pop)) %>%
+  select(-code) %>%
+  # Remove rare breeds
+  group_by(pop) %>%
+  filter(n() >= 50) %>%
+  ungroup() %>%
+  filter(pct > 0.6) %>%
+  inner_join(sample_map, by = c("dog" = "dap_dog_id")) 
+
+
+# Filter for the top 10 most common categories and reverse the order
+top_10_breed_data <- breed_data %>%
+  mutate(pop = gsub("\\.", " ", pop)) %>%
+  mutate(pop = fct_infreq(pop)) %>%
+  filter(pop %in% levels(pop)[1:10]) %>%
+  mutate(pop = fct_rev(pop))  # Reverse the order of the factor levels
+         
+
+# Plot the filtered data with the plot rotated
+p <- top_10_breed_data %>%
+  ggplot(aes(x = pop)) +
+  geom_bar(fill = "#eddcd2", color="black", alpha=1) +
+  coord_flip() +  # Rotate the entire plot
+  labs(x = "Breed") +
+  labs(y = "Dogs") +
+  theme(axis.text.y = element_text(angle = 0, hjust = 1)) + 
+  theme_classic() +
+  theme(
+    axis.text = element_text(size = 14),    # Enlarge axis text
+    axis.title = element_text(size = 16),   # Enlarge axis titles
+    legend.text = element_text(size = 12),  # Enlarge legend text
+    legend.title = element_text(size = 14)  # Enlarge legend title
+  )
+
+
+p # Figure 1D
+```
+
+Plot the general health distribution by life stage
+
+```{r, fig.width=4, fig.height=3.5}
+
+p <- sample_map %>%
+  drop_na(life_stage_at_stool_collection, hs_general_health) %>%
+  mutate(hs_general_health = as.character(hs_general_health)) %>%
+  mutate(hs_general_health = recode(hs_general_health,
+                             "1" = "Excellent",
+                             "2" = "Very good",
+                             "3" = "Good",
+                             "4" = "Fair",
+                             "5" = "Poor",
+                             .default = hs_general_health)) %>% # Retain other values unchanged
+  mutate(life_stage_at_stool_collection = factor(life_stage_at_stool_collection, levels = c("Puppy", "Young Adult", "Mature Adult", "Senior")),
+         hs_general_health = factor(hs_general_health, levels = c("Excellent", "Very good", "Good", "Fair", "Poor"))) %>%
+  ggplot(aes(x=hs_general_health, group=life_stage_at_stool_collection, fill=life_stage_at_stool_collection)) +
+  scale_fill_manual(values = list("Puppy" = "#CA0020", "Young Adult" = "#F4A582",  "Mature Adult" = "#92C5DE", "Senior" = "#0571B0"), name="Life stage") +
+  geom_bar(color="black", alpha=1) +
+  xlab("General health") +
+  ylab("Dogs") +
+  theme_classic() +
+  theme(
+    legend.position = c(0.55, 1),            # Position legend inside plot, upper-left
+    legend.justification = c(0, 1),           # Anchor legend by upper-left corner
+    legend.background = element_rect(fill = "white", color = NA),  # Optional: white background for better visibility
+    axis.text = element_text(size = 14),    # Enlarge axis text
+    axis.title = element_text(size = 16),   # Enlarge axis titles
+    legend.text = element_text(size = 12),  # Enlarge legend text
+    legend.title = element_text(size = 14)  # Enlarge legend title
+  )
+
+
+p # Figure 1E
+
+```
+
+Plot the breed size distribution by life stage
+
+```{r, fig.width=6, fig.height=3.5}
+p <- sample_map %>%
+  drop_na(life_stage_at_stool_collection) %>%
+  mutate(life_stage_at_stool_collection = factor(life_stage_at_stool_collection, levels = c("Puppy", "Young Adult", "Mature Adult", "Senior")),
+         breed_size = factor(breed_size, levels = c("Toy and Small", "Standard", "Medium", "Large", "Giant"))) %>%
+  ggplot(aes(x = life_stage_at_stool_collection, fill=breed_size)) +
+  scale_fill_manual(values = c("#c8553d", "#f28f3b", "#ffd5c2", "#ecf8f8", "#588b8b"), name="Breed size") +
+  geom_bar(color="black", alpha=1) +
+  # coord_flip() +  # Rotate the entire plot
+  xlab("Life stage (at stool collection)") +
+  ylab("Dogs") +
+  theme_classic() +
+  theme(
+    legend.position = c(0.03, 1),            # Position legend inside plot, upper-left
+    legend.justification = c(0, 1),         # Anchor legend by upper-left corner
+    legend.background = element_rect(fill = "white", color = NA),  # Optional: white background for better visibility
+    axis.text = element_text(size = 14),    # Enlarge axis text
+    axis.title = element_text(size = 16),   # Enlarge axis titles
+    legend.text = element_text(size = 12),  # Enlarge legend text
+    legend.title = element_text(size = 14)  # Enlarge legend title
+  ) 
+
+
+p # Figure 1F
+```

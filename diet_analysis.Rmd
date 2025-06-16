@@ -1,0 +1,348 @@
+---
+title: "DAP dogs' diet associations with the microbiome"
+author: "Borenstein Lab"
+date: "April 2025"
+output: html_notebook
+---
+```{r}
+# Preparations
+library(readr)
+library(ggplot2)
+library(tibble)
+library(tidyr)
+library(dplyr)
+library(ape)
+library(cowplot)
+library(vegan)
+library(stringr)
+library(tidymodels)
+library(stringr)
+options(scipen = 999)
+source('../raw_shotgun_processing/raw_data_processing_utils.R')
+source('dap_metadata_utils.R')
+library(corrplot)
+library(forcats)
+library(ggforce)
+library(chattr)
+library(rstatix)
+library(ggprism)
+library(ggrepel)
+```
+
+# Custom function
+```{r}
+
+#get_code_to_label_map
+get_code_to_label_map <- function(codebook, data_table, variable) {
+  tmp <- codebook %>% filter(DataFile == data_table & Variable == variable) %>% select(Values, ValueLabels)  
+  codes <- strsplit(tmp$Values, split = ' | ', fixed = TRUE)[[1]]
+  code_labels <- strsplit(tmp$ValueLabels, split = ' | ', fixed = TRUE)[[1]]
+  names(code_labels) <- as.character(codes)
+  return(code_labels)
+}
+
+```
+
+# Load data
+```{r}
+metadata_dir <- "../data/metadata"
+source('../raw_shotgun_processing/load_batches_1-6.R')
+
+```
+
+
+# Tidy dog owner data
+
+```{r}
+# extract dog health status
+dog_owner <- read_csv("../data/metadata/terra_release_2023_12022024/DAP_2023_HLES_dog_owner_v1.0.csv", 
+  show_col_types = FALSE
+  )%>%
+  mutate(dap_dog_id = as.character(dog_id))%>%
+  select(-dog_id)
+
+codebook_dog_owner <- read_csv(
+  file.path(metadata_dir, "terra_release_2023_12022024", 
+            "DAP_2023_codebook_dog_owner_v1.0.csv"), 
+  show_col_types = FALSE
+  )
+
+tmp_codes <- get_code_to_label_map(codebook_dog_owner, data_table = 'HLES_dog_owner', variable = 'hs_general_health')
+tmp_codes <- trimws(tmp_codes)
+
+dog_owner <- dog_owner %>%
+  mutate(hs_general_health = as.character(hs_general_health)) %>%
+  mutate(hs_general_health = tmp_codes[hs_general_health]) 
+
+# table(dog_owner$hs_general_health)
+
+dog_owner <- dog_owner %>%
+  mutate(hs_general_health = ifelse(hs_general_health %in% c('Fair', 'Good'), 'Fair-Good', hs_general_health)) 
+
+rm(tmp_codes)
+
+```
+
+
+# Fixed effects data
+
+```{r}
+# Fixed effects varibles
+FIXED <- c("breed_size_numeric", "Sex_class" , "age_at_stool_collection", "hs_general_health", "total_reads_before_filtering", "weight_from_vet_or_survey_lbs", "duplication_rate")
+
+# duplication data
+duplication_data <- qc_stats%>%
+  select(total_reads_before_filtering, duplication_rate, sample_id)
+
+
+
+# create final fixed effect data
+fixed_effect_data <- sample_map %>%
+  left_join(duplication_data, by = "sample_id")%>%
+  left_join(dog_owner, by = "dap_dog_id")%>%
+  select(all_of(c("dap_dog_id" , FIXED)))
+```
+
+
+# Load diet data
+
+```{r}
+diet_codes <- c('df_appetite',
+                'df_feedings_per_day',
+                'df_primary_diet_component',
+                'df_treats_frequency',
+                'de_drinking_water_is_filtered',
+                'de_eats_feces',
+                'de_eats_grass_frequency',
+                'df_primary_diet_component_grain_free',
+                'df_primary_diet_component_organic',
+                'df_daily_supplements_antiox',
+                'df_daily_supplements_chondroitin',
+                'df_daily_supplements_fiber',
+                'df_daily_supplements_glucosamine',
+                'df_daily_supplements_omega3',
+                'df_daily_supplements_probiotics',
+                'df_daily_supplements_vitamins')
+
+# Collect diet data
+diet_data <- dog_owner %>%
+  select(dap_dog_id, all_of(diet_codes)) %>%
+  filter(dap_dog_id %in% dog_overview$dap_dog_id) %>%
+  mutate(df_daily_supplements_antiox =      ifelse(is.na(df_daily_supplements_antiox)      | df_daily_supplements_antiox==0, 0, 1)) %>%
+  mutate(df_daily_supplements_chondroitin = ifelse(is.na(df_daily_supplements_chondroitin) | 
+                                                     df_daily_supplements_chondroitin==0, 0, 1)) %>%
+  mutate(df_daily_supplements_fiber =       ifelse(is.na(df_daily_supplements_fiber)       | df_daily_supplements_fiber==0, 0, 1)) %>%
+  mutate(df_daily_supplements_glucosamine = ifelse(is.na(df_daily_supplements_glucosamine) | 
+                                                     df_daily_supplements_glucosamine==0, 0, 1)) %>%
+  mutate(df_daily_supplements_omega3 =      ifelse(is.na(df_daily_supplements_omega3)      | df_daily_supplements_omega3==0, 0, 1)) %>%
+  mutate(df_daily_supplements_probiotics =  ifelse(is.na(df_daily_supplements_probiotics)  | 
+                                                     df_daily_supplements_probiotics==0, 0, 1)) %>%
+  mutate(df_daily_supplements_vitamins =    ifelse(is.na(df_daily_supplements_vitamins)    | 
+                                                     df_daily_supplements_vitamins==0, 0, 1)) %>%
+  mutate(df_treats_frequency = ifelse(df_treats_frequency %in% 2:3, 1, 0)) %>%
+  mutate(de_drinking_water_is_filtered = ifelse(de_drinking_water_is_filtered < 99, de_drinking_water_is_filtered, NA)) %>%
+  mutate(de_eats_feces = ifelse(de_eats_feces < 99, de_eats_feces, NA)) %>%
+  mutate(df_primary_diet_component_grain_free = ifelse(df_primary_diet_component_grain_free == "TRUE", 1, 0)) %>%
+  mutate(df_primary_diet_component_organic = ifelse(df_primary_diet_component_organic == "TRUE", 1, 0))
+
+# Convert some codes to labels
+tmp_codes <- get_code_to_label_map(codebook = codebook_dog_owner,data_table = "HLES_dog_owner", "df_feedings_per_day")
+tmp_codes <- trimws(tmp_codes)
+
+diet_data <- diet_data %>%
+  mutate(df_feedings_per_day = tmp_codes[df_feedings_per_day])
+
+tmp_codes <- get_code_to_label_map(codebook = codebook_dog_owner,data_table = "HLES_dog_owner", "df_appetite")
+tmp_codes <- trimws(tmp_codes)
+
+diet_data <- diet_data %>%
+  mutate(df_appetite = tmp_codes[df_appetite])
+
+tmp_codes <- get_code_to_label_map(codebook = codebook_dog_owner,data_table = "HLES_dog_owner", "de_eats_grass_frequency")
+tmp_codes <- trimws(tmp_codes)
+
+diet_data<- diet_data %>%
+  mutate(de_eats_grass_frequency = as.character(de_eats_grass_frequency),
+         de_eats_grass_frequency = tmp_codes[de_eats_grass_frequency])
+
+tmp_codes <- get_code_to_label_map(codebook = codebook_dog_owner,data_table = "HLES_dog_owner", "df_primary_diet_component")
+tmp_codes <- trimws(tmp_codes)
+
+diet_data<- diet_data %>%
+  mutate(df_primary_diet_component = as.character(df_primary_diet_component),
+         df_primary_diet_component = tmp_codes[df_primary_diet_component])%>%
+    mutate(commercial_diet = case_when(str_detect(df_primary_diet_component, "Commercially") ~ "Commercially prepared",
+                                     str_detect(df_primary_diet_component, "Home") ~ "Home prepared",
+                                     TRUE ~ "Other"))
+diet_codes <- c(diet_codes, "commercial_diet")
+
+# Add sample_ids
+diet_data <-   diet_data%>%
+  left_join(select(sample_map, sample_id, dap_dog_id))%>%
+  drop_na(sample_id)
+
+# Add fixed effect data
+
+metadata <- diet_data%>%
+  left_join(fixed_effect_data)
+
+diet_data%>%
+  count(df_feedings_per_day)
+
+
+```
+
+# PERMANOVA analysis
+
+```{r}
+
+itration_grid <- expand_grid(case_col = diet_codes,
+                             distance_matrix = c("bc"))
+
+pmap(.l = itration_grid, 
+    .f = function(case_col, distance_matrix ,...){
+      
+      print(str_c("working on", " ",case_col,""," " ,distance_matrix))
+
+      # remove subjects with NA
+      metadata_filter <- metadata%>%
+        select(sample_id, !!sym(case_col), all_of(FIXED))%>%
+        drop_na()
+  
+      # Stop if the are no samples in metadata
+      if(length(metadata_filter$sample_id) == 0){
+        print(str_c("Condition with 0 cases - "," ", case_col))
+        
+        }else{
+        distance_matrix_filter <- get(distance_matrix)%>%
+          filter(sample_id %in% metadata_filter$sample_id)%>%
+          select(sample_id, all_of(metadata_filter$sample_id))
+
+                
+        results <- get_permanova(disct_metadata = metadata_filter, 
+                                 dist_matrix = distance_matrix_filter,
+                                 dist_metric_name = distance_matrix,
+                                 sample_id_column = 'sample_id', 
+                                 metadata_cols_to_analyze = case_col, 
+                                 metadata_cols_fix_effects = FIXED,
+                                 fdr_threshold = 0.1,
+                                 permutations = 999)
+  
+  # Collect results table
+  result_table <- results$results%>%
+    as_tibble()%>%
+    rename(case_col = feature)%>%
+    mutate(distance_matrix = distance_matrix)
+  
+  if(result_table$pvals[1] <= 0.05){
+    
+  #edit plot title  
+  plot <- results$plots[[1]]+
+    labs(title = str_c(distance_matrix, " ~ ", case_col))
+  
+  return(list(result_table = result_table, 
+              plot=plot))
+  
+  }else{
+    return(result_table)
+  }
+  }
+  
+})
+
+
+```
+
+# Alpha diversity
+
+```{r fig.width=5, fig.height=3} 
+
+diet_shannon_diversity <- map(.x = diet_codes, 
+    .f = ~feat_boxplot_wilcoxon(feat_name = "shannon_sp" , feat_table = shannon, disct_metadata =metadata, metadata_col_to_analyze =  .x))
+diet_shannon_diversity
+
+
+# Plot de_eats_feces
+feat_boxplot_wilcoxon2(feat_name = "shannon_sp" , feat_table = shannon, disct_metadata =metadata, metadata_col_to_analyze =  "de_eats_feces")%>%
+  pluck("df")%>%
+  mutate(de_eats_feces = ifelse(de_eats_feces == 1, "Eats feces", "Does not eat feces"))%>%
+  ggplot(aes(x = de_eats_feces, y = shannon_sp ))+
+  stat_slab(aes(thickness = after_stat(pdf*n), fill =de_eats_feces), scale = 0.7, side = "bottom", alpha = 0.75) +
+  stat_dotsinterval(scale = 0.7, slab_linewidth = NA, color = "black")+
+  theme_classic(base_size = 15)+
+  labs(x = "Eats feces", y = "Shannon diversity")+
+  scale_fill_manual(values = c("#fb8500", "#219ebc"))
+
+
+select(metadata, sample_id, de_eats_feces)%>%
+  left_join(shannon)%>%
+group_by(de_eats_feces)%>%
+  summarise(mean = mean(shannon_sp, na.rm = TRUE),
+            sd = sd(shannon_sp, na.rm = TRUE),
+            n = n())
+
+
+```
+
+# Differential_abundance of taxa and functions
+
+```{r fig.width=5, fig.height=3}
+
+# Taxa
+specie_diet_diff_abnd <- get_differential_abundance(feat_table = ra_kraken_sp, disct_metadata = metadata, metadata_cols_to_analyze = diet_codes)
+genus_diet_diff_abnd<- get_differential_abundance(feat_table = ra_kraken_ge, disct_metadata = metadata, metadata_cols_to_analyze = diet_codes)
+phylum_diet_diff_abnd<- get_differential_abundance(feat_table = ra_kraken_ph, disct_metadata = metadata, metadata_cols_to_analyze = diet_codes)
+
+specie_diet_diff_abnd$sig_results <- specie_diet_diff_abnd$sig_results%>%
+  mutate(type = "species")
+genus_diet_diff_abnd$sig_results <- genus_diet_diff_abnd$sig_results%>%
+  mutate(type = "genus")
+phylum_diet_diff_abnd$sig_results <- phylum_diet_diff_abnd$sig_results%>%
+  mutate(type = "phylum")
+
+# Functions
+kegg_pwys_diet_diff_abnd<- get_differential_abundance(feat_table = kegg_pwys, disct_metadata = metadata, metadata_cols_to_analyze = diet_codes)
+kegg_modules_diet_diff_abnd<- get_differential_abundance(feat_table = kegg_modules, disct_metadata = metadata, metadata_cols_to_analyze = diet_codes)
+
+kegg_pwys_diet_diff_abnd$sig_results <- kegg_pwys_diet_diff_abnd$sig_results%>%
+  mutate(type = "pathway")
+kegg_modules_diet_diff_abnd$sig_results <- kegg_modules_diet_diff_abnd$sig_results%>%
+  mutate(type = "module")
+
+
+
+# Combine all stat signif results
+all_sig_results <-map(.x= c("specie_diet_diff_abnd", "genus_diet_diff_abnd", "phylum_diet_diff_abnd", "kegg_modules_diet_diff_abnd"),
+      .f = ~get(.x)%>%pluck("sig_results"))%>%
+  bind_rows()%>%
+  as_tibble()
+
+all_results <-map(.x= c("specie_diet_diff_abnd", "genus_diet_diff_abnd", "phylum_diet_diff_abnd", "kegg_modules_diet_diff_abnd"),
+      .f = ~get(.x)%>%pluck("all_results"))%>%
+  bind_rows()%>%
+  as_tibble()
+
+#Print table for SI
+
+all_sig_results%>%
+  filter(FDR<0.05)%>%
+  write_csv("diet_microbiome.csv")
+
+
+# Volcano plot for de_eats_feces
+
+filter(specie_diet_diff_abnd$all_results, metadata == "de_eats_feces")%>%
+  mutate(stat_signif = if_else(FDR < 0.05, "Significant", "Not significant"),
+         plot_text = if_else(stat_signif == "Significant", true = feature, false = ""))%>%
+  ggplot(aes(x= coef , y = -log10(FDR)))+
+  geom_point(size = 3.5,aes( alpha = stat_signif, fill = stat_signif), shape = 21, color = "grey30", show.legend = c(alpha = FALSE))+
+  geom_text_repel(aes(label = plot_text), size = 4, nudge_x = 0.5, nudge_y = 0.5, box.padding = 0.5, max.overlaps = 1)+
+  theme_classic(base_size = 15)+
+  labs( x= "Regression coefficent", y = "-log(FDR)", fill ="Statistical significance")+
+  scale_alpha_discrete(range = c(0.05, 0.5))+
+  scale_fill_manual(values = c("Significant" = "#832161", "Not significant" = "grey30"))+
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red")+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey70")
+
+
+```
