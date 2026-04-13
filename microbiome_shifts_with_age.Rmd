@@ -441,6 +441,8 @@ p # Supplementary Figure S4
 
 # Section 2: specific species shifts - aging markers
 
+## Continuous analysis
+
 ```{r}
 res_ph <- run_continuous_maaslin(feat_table = ra_kraken_ph,
                                 metadata =  sample_map %>% 
@@ -540,6 +542,567 @@ p <- res_sp$all_results %>%
   theme_classic()
 
 p # Figure 3E
+```
+
+
+## Categorical analysis
+
+```{r}
+get_differential_abundance <- function(feat_table, 
+                                       disct_metadata, 
+                                       sample_id_column = 'sample_id', 
+                                       metadata_cols_to_analyze = NULL,
+                                       metadata_cols_fix_effects = NULL,
+                                       metadata_cols_rand_effects = NULL,
+                                       fdr_threshold = 0.1,
+                                       output_dir = "MaAsLin2_output",
+                                       return_maaslin_plots = FALSE,
+                                       keep_maaslin_plots = FALSE,
+                                       normalization_method = "NONE",
+                                       transformation_method = "LOG",
+                                       analysis_method = "LM",
+                                       category_name_map = NULL,
+                                       skip_fdr_correction = FALSE,
+                                       logscale_y_for_plot = FALSE,
+                                       quiet = FALSE,
+                                       ord=NULL) {
+  # Required libraries loading
+  require(Maaslin2)
+  require(ggplot2)
+  require(ggsignif)
+  require(grid)
+  require(png)
+  require(dplyr)
+  require(ggpubr)
+  require(purrr)
+  
+  # Data verifications
+  
+  # In case maaslin plots required, change keep_maaslin_plots to TRUE.
+  if (return_maaslin_plots & !(keep_maaslin_plots)){
+    message("Can not return maaslin plots if keep_maaslin_plots = FALSE. keep_maaslin_plots was changed to TRUE.\n")
+    keep_maaslin_plots = TRUE
+  }
+  
+  # If no metadata_cols_to_analyze provided, run the MaAsLin2 on all the metadata columns.
+  if (is.null(metadata_cols_to_analyze))
+    metadata_cols_to_analyze = colnames(disct_metadata)
+  
+  # Check if metadata columns are discrete (1, 0 and NA).
+  for (col in metadata_cols_to_analyze){ 
+    if (length(unique(disct_metadata[,col])) > 3)
+      warning(paste0("Too many values in disct_metadata in the ", col, " column"))
+  }
+  
+  # Check if normalization method fits the data (if only one column: normalization method cannot be 'TSS')
+  if ((ncol(feat_table) ==  2) & (normalization_method == "TSS")){
+    stop("TSS normlaization is not allowed in case there is only one feature in feat_table. 
+         Try again with normalization_method = 'NONE'.")
+  }
+  
+  # Create output directory (will be deleted if not required).
+  if (!dir.exists(output_dir))
+    dir.create(output_dir)
+  
+  # Convert sample_id column to rownames for MaAsLin2 run.
+  disct_metadata <- disct_metadata %>% remove_rownames %>% column_to_rownames(var=sample_id_column)
+  feat_table <- feat_table %>% remove_rownames %>% column_to_rownames(var=sample_id_column)
+  
+  # Remove samples not in both tables, and order samples identically
+  samples_to_include <- intersect(row.names(disct_metadata), row.names(feat_table))
+  disct_metadata <- disct_metadata[samples_to_include,]
+  feat_table <- feat_table[samples_to_include,,drop=FALSE]
+  
+  # TODO: warn if some samples were not in both tables
+  
+  # Check that all the metadata_cols_rand_effects are not in metadata_cols_to_analyze.
+  for (rand_col in metadata_cols_rand_effects){
+    if (rand_col %in% metadata_cols_to_analyze)
+      stop(paste0("Shared column between metadata_cols_rand_effects and metadata_cols_to_analyze: ", 
+                  rand_col, "\nTry again with different metadata_cols_rand_effects!\n"))
+  }
+  
+  # Go over fixed effects and perform one-hot encoding if needed
+  fixed_cols_final_names <- c()
+  for (fixed_col in metadata_cols_fix_effects) {
+
+    # Validate that metadata_cols_fix_effects are not in metadata_cols_to_analyze.
+    if (fixed_col %in% metadata_cols_to_analyze)
+      stop(paste0("Shared column between metadata_cols_fix_effects and metadata_cols_to_analyze: ", 
+                  fixed_col, "\nTry again with different metadata_cols_fix_effects!\n"))
+    
+    # Check if fixed column is numeric with less than 5 unique values or categorical. Perform one-hot encoding in these cases.
+    if (((is.numeric(disct_metadata[, fixed_col])) & 
+         (n_distinct(disct_metadata[, fixed_col]) < 5)) | 
+        (!is.numeric(disct_metadata[, fixed_col]))) {
+      
+      # Print a message if there are more than 5 categories in the metadata_cols_fix_effects because it might affect the FDR correction.
+      if (n_distinct(disct_metadata[[fixed_col]]) > 5)
+        message("Too many unique values in ", fixed_col, " column. It might affect the FDR correction and omit some significant results!")
+      
+      # Perform one-hot encoding for columns if they have more then 2 categories.
+      if (n_distinct(disct_metadata[[fixed_col]]) > 2){
+        message("Performing one-hot encoding on ", fixed_col)
+        fixed_cols_final_names <- c(fixed_cols_final_names, paste(fixed_col, unique(disct_metadata[[fixed_col]]), sep = '_'))
+        tmp_metadata_rownames <- rownames(disct_metadata)
+        disct_metadata <- disct_metadata %>% mutate(value = 1)  %>% spread(fixed_col, value,  fill = 0, sep = '_')
+        rownames(disct_metadata) <- tmp_metadata_rownames
+        
+      } else { # Categorical with 2 values or less. One-hot is not needed 
+        fixed_cols_final_names <- c(fixed_cols_final_names, fixed_col)
+      }
+      
+    } else { # Numeric case, one-hot is not needed  
+      fixed_cols_final_names <- c(fixed_cols_final_names, fixed_col)
+    }
+  }
+  
+  # Rum MaAsLin2
+  maaslin2_signif_results <- data.frame() # Initialize
+  maaslin2_all_results <- data.frame() # Initialize
+  
+  for (col in metadata_cols_to_analyze) {
+    if (!quiet) message('Working on column: ', col)
+    
+    # For multi-category variables, we run differential abundance separately for each pair of categories
+    for (pair in combn(na.omit(unique(disct_metadata[[col]])), 2, simplify = FALSE)) {
+      
+      # Keep only the two selected values (also drop missing values)
+      tmp_metadata <- disct_metadata[(!is.na(disct_metadata[[col]])) & (disct_metadata[[col]] %in% pair), ]
+      
+      # Get the final list of samples for which DA will be calculated
+      samples_to_include <- intersect(row.names(tmp_metadata), row.names(feat_table))
+      tmp_metadata <- tmp_metadata[samples_to_include,,drop=F]
+      tmp_feat_table <- feat_table[samples_to_include,,drop=F]
+      
+      # Remove constant columns if exist
+      tmp_metadata <- tmp_metadata[, apply(tmp_metadata, 2, n_distinct) > 1]
+      
+      # Fix column names if needed
+      colnames(tmp_metadata) <- make.names(colnames(tmp_metadata))
+      if (!is.null(metadata_cols_rand_effects))
+        metadata_cols_rand_effects <- make.names(metadata_cols_rand_effects)
+      
+      invisible(capture.output(tmp_results <- Maaslin2(
+        input_data = tmp_feat_table, 
+        input_metadata = tmp_metadata, 
+        output = paste(output_dir, "/", col, sep=""),
+        fixed_effects = make.names(c(col, fixed_cols_final_names)),
+        random_effects = metadata_cols_rand_effects,
+        normalization = normalization_method,
+        transform = transformation_method,
+        analysis_method = analysis_method,
+        plot_scatter = keep_maaslin_plots,
+        max_significance = fdr_threshold,
+        plot_heatmap = FALSE
+      )))
+      
+      tmp_results$results$pair_a <- as.character(pair[[1]])
+      tmp_results$results$pair_b <- as.character(pair[[2]])
+      
+      # Save significant results only
+      maaslin2_signif_results <- bind_rows(
+        maaslin2_signif_results,
+        tmp_results$results %>% filter(qval <= fdr_threshold)
+      )
+      
+      # Save all results
+      maaslin2_all_results <- bind_rows(
+        maaslin2_all_results,
+        tmp_results$results
+      )
+    }
+  }
+  
+  # New FDR 
+  if (skip_fdr_correction){
+    maaslin2_all_results$FDR <- maaslin2_all_results$pval
+  } else {
+    maaslin2_all_results$FDR <- p.adjust(maaslin2_all_results$pval, 'fdr')
+  }
+  maaslin2_signif_results <- maaslin2_all_results[maaslin2_all_results$FDR < fdr_threshold,]
+  
+  # Return significant results only for column in metadata_cols_to_analyze (and not in metadata_cols_fix_effects).
+  maaslin2_signif_results <- maaslin2_signif_results[maaslin2_signif_results$metadata %in% metadata_cols_to_analyze, ]
+  
+  # Generate plots to plots list
+  plots <- list()
+  
+  if (nrow(maaslin2_signif_results) > 0) {
+    if (return_maaslin_plots) {
+      png_list <- fs::dir_ls(path = output_dir, recurse = TRUE, type = "file", glob = "*.png")
+      for (png_dir in png_list){
+        print(png_dir)
+        plots[[png_dir]] <- rasterGrob(readPNG(png_dir))
+      }
+    } else {
+      
+      # Fix feature names to match how maaslin outputs them
+      feat_table2 <- feat_table
+      names(feat_table2) <- make.names(names(feat_table2))
+      
+      
+      for (col in unique(maaslin2_signif_results$metadata)){
+        for (feat in unique(maaslin2_signif_results$feature)){
+          
+          unique_signif_results <- maaslin2_signif_results[(maaslin2_signif_results$metadata == col) & (maaslin2_signif_results$feature == feat), ]
+          if (dim(unique_signif_results)[1] == 0)
+            next
+            
+
+          tmp_metadata <- disct_metadata %>% tidyr::drop_na(col)
+          samples_to_include <- intersect(row.names(tmp_metadata), row.names(feat_table2))
+          tmp_metadata <- tmp_metadata[samples_to_include,,drop=FALSE]
+          feat_table2 <- feat_table[samples_to_include,,drop=FALSE]
+          
+          tmp <- data.frame(
+            col_vals = tmp_metadata[[col]],
+            feat_vals = feat_table2[[feat]]
+          )
+          
+          if (!is.null(category_name_map)) 
+            tmp$col_vals <- factor(category_name_map[as.character(tmp$col_vals)],
+                                   levels = unname(category_name_map))
+          
+          y_m <- max(tmp$feat_vals) 
+          tmp$col_vals<- as.character(tmp$col_vals)
+          
+          # Add number of samples in each group to the x-axis ticks.
+          xlabs <- list()
+          for (val in as.character(unique(tmp$col_vals)))
+            xlabs[[val]] = paste0(val,"\n(", dim(tmp[as.character(tmp$col_vals) == val,])[1], ")")
+          
+          # Sort the tmp dataset based on the specified order
+          if (!is_null(ord)){     
+            tmp$col_vals <- factor(tmp$col_vals, levels = ord)
+            tmp <- tmp[order(tmp$col_vals), ]
+          }
+          
+          # p <- ggplot(tmp, aes(x = col_vals, group = col_vals, y = feat_vals)) +
+          #   geom_boxplot(aes(fill = col_vals), color = 'black', alpha = 0.4, outlier.shape = NA) +                      geom_jitter(height = 0, width = 0.1, alpha = 0.2, color = 'black', size = 2) +
+          #   theme_classic() +
+          #   xlab(col) +
+          #   ylab(feat) +
+          #   # labs(subtitle = 'MaAsLin2') +
+          #   theme(plot.subtitle = element_text(hjust = 0.5)) +
+          #   scale_x_discrete(labels=xlabs) +
+          #   scale_fill_manual(values = list("Puppy" = "#CA0020", "Young Adult" = "#F4A582",  
+          #                                   "Mature Adult" = "#92C5DE", "Senior" = "#0571B0")) +
+          #   theme(legend.position = "none")
+          
+          p <- ggplot(tmp, aes(x = col_vals, group = col_vals, y = feat_vals)) +
+              geom_boxplot(aes(fill = col_vals), color = 'black', alpha = 0.4, outlier.shape = NA) +
+              geom_jitter(height = 0, width = 0.1, alpha = 0.2, color = 'black', size = 2) +
+              theme_classic() +
+              xlab(gsub("_", " ", tools::toTitleCase(col))) +
+              ylab(feat) +
+              theme(plot.subtitle = element_text(hjust = 0.5)) +
+              scale_x_discrete(labels = xlabs) +
+              scale_fill_manual(values = c(
+                "Puppy" = "#CA0020",
+                "Young Adult" = "#F4A582",
+                "Mature Adult" = "#92C5DE",
+                "Senior" = "#0571B0"
+              )) +
+              theme(legend.position = "none")
+          
+          
+          unique_signif_results$group1 <- unique_signif_results$pair_a
+          unique_signif_results$group2 <- unique_signif_results$pair_b
+          
+          makeStars <- function(x){
+            stars <- c("****", "***", "**", "*")
+            vec <- c(0, fdr_threshold/1000, fdr_threshold/100, fdr_threshold/10 ,fdr_threshold)
+            i <- findInterval(x, vec)
+            stars[i]
+          }
+          
+          unique_signif_results$FDR <- makeStars(unique_signif_results$FDR)
+          
+          p <- p + stat_pvalue_manual(unique_signif_results,
+                                      y.position = max(tmp$feat_vals),
+                                      step.increase = 0.1 ,
+                                      label = "FDR")
+
+          # Log scale y axis if needed
+          if (logscale_y_for_plot) {
+            p <- p + yscale("log10", .format = TRUE)
+          }
+          plots[[paste(col, feat, collapse = ';')]] <- p
+        }
+      }
+    } 
+  }
+  
+  if (! keep_maaslin_plots){
+    unlink(output_dir, recursive=TRUE)
+  }
+  
+  
+  return(list(sig_results = maaslin2_signif_results, all_results = maaslin2_all_results, plots = plots))
+}
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(gridExtra)
+
+# --------------------------------------------------
+# Global settings
+# --------------------------------------------------
+sample_id_col <- "sample_id"
+life_stage_levels <- c("Puppy", "Young Adult", "Mature Adult", "Senior")
+main_metadata_col <- "life_stage_at_stool_collection"
+
+# --------------------------------------------------
+# Helper function
+# --------------------------------------------------
+run_da_summary <- function(feat_table, sample_map, output_dir_name) {
+  
+  # ----------------------------------------------
+  # 1. Run differential abundance
+  # ----------------------------------------------
+  res <- get_differential_abundance(
+    feat_table = feat_table,
+    disct_metadata = sample_map %>%
+      filter(!is.na(weight_from_vet_or_survey_lbs)) %>%
+      mutate(breed_size_numeric = as.numeric(breed_size_numeric)),
+    sample_id_column = sample_id_col,
+    metadata_cols_to_analyze = c(main_metadata_col),
+    metadata_cols_fix_effects = FIXED,
+    metadata_cols_rand_effects = RANDOM,
+    fdr_threshold = 0.05,
+    output_dir = output_dir_name,
+    transformation_method = "LOG",
+    keep_maaslin_plots = FALSE,
+    category_name_map = NULL,
+    logscale_y = TRUE,
+    return_maaslin_plots = FALSE,
+    ord = life_stage_levels
+  )
+  
+  # ----------------------------------------------
+  # 2. Merge feature table with metadata
+  #    and remove missing life-stage values
+  # ----------------------------------------------
+  df <- feat_table %>%
+    inner_join(
+      sample_map %>% select(sample_id, all_of(main_metadata_col)),
+      by = "sample_id"
+    ) %>%
+    filter(!is.na(.data[[main_metadata_col]])) %>%
+    mutate(
+      !!main_metadata_col := factor(
+        .data[[main_metadata_col]],
+        levels = life_stage_levels
+      )
+    ) %>%
+    droplevels()
+  
+  # ----------------------------------------------
+  # 3. Convert to long format
+  # ----------------------------------------------
+  df_long <- df %>%
+    pivot_longer(
+      cols = -c(all_of(sample_id_col), all_of(main_metadata_col)),
+      names_to = "taxon",
+      values_to = "abundance"
+    )
+  
+  # ----------------------------------------------
+  # 4. Summary statistics by taxon and life stage
+  # ----------------------------------------------
+  summary_stats <- df_long %>%
+    group_by(.data[[main_metadata_col]], taxon) %>%
+    summarise(
+      median_abundance = median(abundance, na.rm = TRUE),
+      q25 = quantile(abundance, 0.25, na.rm = TRUE),
+      q75 = quantile(abundance, 0.75, na.rm = TRUE),
+      prevalence = mean(abundance > 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  summary_stats_wide <- summary_stats %>%
+    pivot_wider(
+      id_cols = taxon,
+      names_from = all_of(main_metadata_col),
+      values_from = c(median_abundance, q25, q75, prevalence),
+      names_sep = "__"
+    )
+  
+  # ----------------------------------------------
+  # 5. MaAsLin results in wide format
+  # ----------------------------------------------
+  maaslin_wide <- res$all_results %>%
+    filter(metadata == main_metadata_col) %>%
+    mutate(comparison = paste(pair_a, pair_b, sep = "_vs_")) %>%
+    select(feature, comparison, coef, stderr, pval, FDR) %>%
+    distinct() %>%
+    pivot_wider(
+      id_cols = feature,
+      names_from = comparison,
+      values_from = c(coef, stderr, pval, FDR),
+      names_sep = "__"
+    ) %>%
+    rename(taxon = feature)
+  
+  # ----------------------------------------------
+  # 6. Final merged table
+  # ----------------------------------------------
+  final_table <- summary_stats_wide %>%
+    left_join(maaslin_wide, by = "taxon")
+  
+  # ----------------------------------------------
+  # 7. Order taxa by mean abundance
+  # ----------------------------------------------
+  top_taxa <- df_long %>%
+    group_by(taxon) %>%
+    summarise(
+      mean_abundance = mean(abundance, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(mean_abundance)) %>%
+    pull(taxon)
+  
+  print(top_taxa[1:min(20, length(top_taxa))])
+  
+  # ----------------------------------------------
+  # 8. Select first 16 existing plots by top_taxa order
+  # ----------------------------------------------
+  plot_names <- names(res$plots)
+  
+  selected_plot_names <- c()
+  
+  for (tx in top_taxa) {
+    this_plot_name <- paste(main_metadata_col, tx)
+    
+    if (this_plot_name %in% plot_names) {
+      selected_plot_names <- c(selected_plot_names, this_plot_name)
+    }
+    
+    if (length(selected_plot_names) == 16) {
+      break
+    }
+  }
+  
+  plot_list_16 <- res$plots[selected_plot_names]
+  
+  plot_grid <- arrangeGrob(
+    grobs = plot_list_16,
+    ncol = 4,
+    nrow = 4
+  )
+  
+  # ----------------------------------------------
+  # 9. Return all outputs
+  # ----------------------------------------------
+  list(
+    res = res,
+    df = df,
+    df_long = df_long,
+    summary_stats = summary_stats,
+    summary_stats_wide = summary_stats_wide,
+    maaslin_wide = maaslin_wide,
+    final_table = final_table,
+    top_taxa = top_taxa,
+    selected_plot_names = selected_plot_names,
+    plot_list_16 = plot_list_16,
+    plot_grid = plot_grid
+  )
+}
+```
+
+
+```{r}
+# --------------------------------------------------
+# Run for species
+# --------------------------------------------------
+out_species <- run_da_summary(
+  feat_table = ra_kraken_sp,# %>% select(1:3),
+  sample_map = sample_map,
+  output_dir_name = "da_species"
+)
+
+# --------------------------------------------------
+# Run for genus
+# --------------------------------------------------
+out_genus <- run_da_summary(
+  feat_table = ra_kraken_ge,# %>% select(1:30),
+  sample_map = sample_map,
+  output_dir_name = "da_genus"
+)
+
+# --------------------------------------------------
+# Run for phylum
+# --------------------------------------------------
+out_phylum <- run_da_summary(
+  feat_table = ra_kraken_ph,# %>% select(1:30),
+  sample_map = sample_map,
+  output_dir_name = "da_phylum"
+)
+
+# --------------------------------------------------
+# Run for KEGG modules
+# --------------------------------------------------
+out_kegg_modules <- run_da_summary(
+  feat_table = kegg_modules %>% select(-unknown),# %>% select(1:3),
+  sample_map = sample_map,
+  output_dir_name = "da_kegg_modules"
+)
+
+# --------------------------------------------------
+# Run for KEGG pathways
+# --------------------------------------------------
+out_kegg_pathway <- run_da_summary(
+  feat_table = kegg_pwys %>% select(-unknown),# %>% select(1:3),
+  sample_map = sample_map,
+  output_dir_name = "da_kegg_pathway"
+)
+
+```
+
+
+```{r}
+grid::grid.newpage()
+grid::grid.draw(out_species$plot_grid) # Supplementary Figure S5
+
+grid::grid.newpage()
+grid::grid.draw(out_genus$plot_grid) # Supplementary Figure S6
+```
+
+
+```{r}
+modules_anno <- read.delim("modules_from_kegg.csv", 
+                      sep = ",") %>%
+  rename(feature = entry, kegg_description = module_name)
+
+ko_anno <- read.delim("pathways_from_kegg.list", 
+                      sep = "\t", skip = 1) %>%
+  rownames_to_column(var = "feature") %>%
+  rename(kegg_description = X..Global.and.overview.maps) %>%
+  # Add prefix of "ko" at the feature name
+  mutate(feature = paste0("ko", feature))
+
+kegg_anno <- bind_rows(ko_anno, modules_anno)
+
+supp_table <- bind_rows(
+  out_species$final_table %>% mutate(feature_type = "species"),
+  out_genus$final_table %>% mutate(feature_type = "genus"),
+  out_phylum$final_table %>% mutate(feature_type = "phylum"),
+  out_kegg_modules$final_table %>% mutate(feature_type = "kegg_module"),
+  out_kegg_pathway$final_table %>% mutate(feature_type = "kegg_pathway")
+) %>%
+  relocate(feature_type, .before = taxon) %>%
+  rename(feature = taxon) %>% 
+  left_join(kegg_anno, by = "feature") %>%
+  relocate(kegg_description, .before = median_abundance__Puppy) 
+
+supp_table %>%
+  write.csv("supplementary_table_s12.csv", row.names = FALSE)
+
 ```
 
 
@@ -754,9 +1317,10 @@ p_leg <- ggplot(legend_dat, aes(y = status)) +
 # Combine plot + legend panel
 p <- cowplot::plot_grid(p_main, p_leg, ncol = 2, rel_widths = c(1, 0.45))
 
-p # Supplementary Figure S5
+p # Supplementary Figure S7
 
 ```
+
 
 # Section 3: predict age based on microbiome features
 
@@ -773,23 +1337,48 @@ get_predictability_regression_for_age_pred <- function(feat_table,
                                                        n_ml_folds = 5,
                                                        feat_importance = 'none',
                                                        rand_seed = 1111,
-                                                       quiet = FALSE) {
+                                                       quiet = FALSE){
   # Required libraries loading
   require(rsample)
   require(dplyr)
   require(glmnet)
   require(ranger)
-  require(metap) 
+  require(metap)
+  require(tibble)
   
   # Argument validations 
-  if(! all(vars_to_analyze %in% names(metadata)))
-    stop("Invalid 'vars_to_analyze' argument. Some of the variables provided are missing from the metadata table")
-  if(is.null(vars_to_analyze))
+  if (is.null(vars_to_analyze))
     stop("Invalid 'vars_to_analyze' argument. Cannot be NULL")
-  if(! ml_method %in% c('rf'))
+  if (!all(vars_to_analyze %in% names(metadata)))
+    stop("Invalid 'vars_to_analyze' argument. Some of the variables provided are missing from the metadata table")
+  if (!ml_method %in% c('rf'))
     stop("Invalid 'ml_method' argument. Only 'rf' supported.")
-  if (! corr_method %in% c('pearson', 'spearman'))
+  if (!corr_method %in% c('pearson', 'spearman'))
     stop("Invalid 'corr_method' argument. Only 'pearson' and 'spearman' supported.")
+  
+  # Metric helper functions
+  rmse_fun <- function(obs, pred) {
+    sqrt(mean((obs - pred)^2, na.rm = TRUE))
+  }
+  
+  mae_fun <- function(obs, pred) {
+    mean(abs(obs - pred), na.rm = TRUE)
+  }
+  
+  r2_fun <- function(obs, pred) {
+    obs <- as.numeric(obs)
+    pred <- as.numeric(pred)
+    ss_res <- sum((obs - pred)^2, na.rm = TRUE)
+    ss_tot <- sum((obs - mean(obs, na.rm = TRUE))^2, na.rm = TRUE)
+    if (is.na(ss_tot) || ss_tot == 0) return(NA_real_)
+    1 - ss_res / ss_tot
+  }
+  
+  sumlog2 <- function(ps) {
+    ps <- ps[!is.na(ps)]
+    if (length(ps) == 0) return(NA_real_)
+    metap::sumlog(ps)$p
+  }
   
   # Main calculations
   n_samples <- nrow(feat_table)
@@ -803,8 +1392,9 @@ get_predictability_regression_for_age_pred <- function(feat_table,
   )
   
   # Collect evaluation stats here
-  cv_correlations <- data.frame()
+  cv_metrics <- data.frame()
   cv_feat_imp <- data.frame()
+  fold_preds_all <- list()
   
   # Fix names of features (causes errors in some models)
   names(feat_table) <- make.names(names(feat_table))
@@ -816,10 +1406,11 @@ get_predictability_regression_for_age_pred <- function(feat_table,
     # Prepare temporary table for training (features + label only)
     tmp <- feat_table %>% 
       left_join(
-        metadata[,c(sample_id_column, measure)] %>% 
+        metadata[, c(sample_id_column, measure)] %>% 
           rename(Label = 2), 
-        by = sample_id_column)
-
+        by = sample_id_column
+      )
+    
     pred_per_fold_list <- list()
     
     # Cross validation loop
@@ -828,89 +1419,152 @@ get_predictability_regression_for_age_pred <- function(feat_table,
       
       # Get train/test samples of this fold
       train_samples <- folds$splits[[i]]$in_id
-      train_data <- tmp[train_samples,] %>% filter(!is.na(Label))
-      test_data <- tmp[-train_samples,] %>% filter(!is.na(Label))
+      train_data <- tmp[train_samples, ] %>% filter(!is.na(Label))
+      test_data  <- tmp[-train_samples, ] %>% filter(!is.na(Label))
       
       test_data_with_sample_id <- test_data
+      
       train_data <- train_data %>%
         select(-any_of(c(sample_id_column)))
       test_data <- test_data %>%
         select(-any_of(c(sample_id_column)))
       
+      # Subset training and testing data
+      train_data_boruta <- train_data
+      test_data_boruta  <- test_data
+      
       # Train RF
-      rf_model <- ranger(Label ~ ., data = train_data, importance = ifelse(feat_importance=='altmann','permutation','none'), seed = rand_seed)
+      rf_model <- ranger(
+        Label ~ ., 
+        data = train_data_boruta, 
+        importance = ifelse(feat_importance == 'altmann', 'permutation', 'none'),
+        seed = rand_seed
+      )
+      
       if (feat_importance != 'none') {
-        feat_imp <- importance_pvalues(rf_model, method="altmann", formula = Label ~ ., data = train_data, seed = rand_seed)
+        feat_imp <- importance_pvalues(
+          rf_model, 
+          method = "altmann", 
+          formula = Label ~ ., 
+          data = train_data_boruta, 
+          seed = rand_seed
+        )
       }
       
       # Make prediction on held out samples
-      preds <- predict(rf_model, test_data %>% select(-Label))$predictions
+      preds <- predict(rf_model, test_data_boruta %>% select(-Label))$predictions
       
-      
-      # Calculate model performance for this fold
-      tmp_eval <- data.frame(preds = preds, true_label = test_data$Label, sample_id = test_data_with_sample_id$sample_id)  
+      # Store fold predictions
+      tmp_eval <- data.frame(
+        measure = measure,
+        fold_id = fold_id,
+        preds = preds,
+        true_label = test_data_boruta$Label,
+        sample_id = test_data_with_sample_id[[sample_id_column]]
+      )
       
       pred_per_fold_list[[i]] <- tmp_eval
+      fold_preds_all[[paste0(measure, "__", i)]] <- tmp_eval
       
-      cv_correlations <- bind_rows(
-        cv_correlations,
+      # Correlation test only if enough variance / observations
+      cor_val <- NA_real_
+      cor_pval <- NA_real_
+      
+      if (nrow(tmp_eval) >= 3 &&
+          stats::sd(tmp_eval$preds, na.rm = TRUE) > 0 &&
+          stats::sd(tmp_eval$true_label, na.rm = TRUE) > 0) {
+        
+        cor_val <- suppressWarnings(
+          cor(tmp_eval$preds, tmp_eval$true_label, method = corr_method, use = "complete.obs")
+        )
+        
+        cor_pval <- suppressWarnings(
+          cor.test(
+            tmp_eval$preds,
+            tmp_eval$true_label,
+            alternative = 'greater',
+            method = corr_method,
+            exact = FALSE
+          )$p.value
+        )
+      }
+      
+      # Collect per-fold metrics
+      cv_metrics <- bind_rows(
+        cv_metrics,
         data.frame(
           measure = measure,
           fold_id = fold_id,
-          test_cor = cor(tmp_eval$preds, tmp_eval$true_label, method = corr_method),
-          test_cor_p = cor.test(tmp_eval$preds, 
-                                tmp_eval$true_label, 
-                                alternative = 'greater', # Check positive association
-                                method = corr_method,
-                                exact = FALSE)$p.value
+          test_cor = cor_val,
+          test_cor_p = cor_pval,
+          rmse = rmse_fun(tmp_eval$true_label, tmp_eval$preds),
+          mae = mae_fun(tmp_eval$true_label, tmp_eval$preds),
+          r2 = r2_fun(tmp_eval$true_label, tmp_eval$preds)
         )
       )
       
-      if (feat_importance != 'none')
+      # Collect feature importance
+      if (feat_importance != 'none') {
         cv_feat_imp <- bind_rows(
           cv_feat_imp,
           as.data.frame(feat_imp) %>% 
             tibble::rownames_to_column('feature') %>%
             mutate(measure = measure, fold_id = fold_id)
         )
+      }
     }
   }
   
-  sumlog2 <- function(ps) {ps <- ps[!is.na(ps)]; return(sumlog(ps)$p)}
-  
   # Summarise over folds
-  summary_correlations <- cv_correlations %>%
+  summary_correlations <- cv_metrics %>%
     group_by(measure) %>%
-    summarise(n_folds = n(),
-              mean_cor = mean(test_cor, na.rm = TRUE),
-              sd_cor = sd(test_cor, na.rm = TRUE),
-              p = sumlog2(test_cor_p),
-              .groups = "drop") %>%
-    mutate(fdr = p.adjust(p)) %>%
-    mutate(Significant = fdr < fdr_threshold & mean_cor > corr_threshold)
+    summarise(
+      n_folds = n(),
+      mean_cor = mean(test_cor, na.rm = TRUE),
+      sd_cor = sd(test_cor, na.rm = TRUE),
+      mean_rmse = mean(rmse, na.rm = TRUE),
+      sd_rmse = sd(rmse, na.rm = TRUE),
+      mean_mae = mean(mae, na.rm = TRUE),
+      sd_mae = sd(mae, na.rm = TRUE),
+      mean_r2 = mean(r2, na.rm = TRUE),
+      sd_r2 = sd(r2, na.rm = TRUE),
+      p = sumlog2(test_cor_p),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      fdr = p.adjust(p, method = "fdr"),
+      Significant = fdr < fdr_threshold & mean_cor > corr_threshold
+    )
   
   # Summarize feature importance (if requested by user)
   summary_feat_importance <- data.frame()
-  if (feat_importance != 'none')
+  if (feat_importance != 'none') {
     summary_feat_importance <- cv_feat_imp %>%
       group_by(measure, feature) %>%
-      summarise(n_folds = n(),
-                mean_feat_importance = mean(importance, na.rm = TRUE),
-                sd_feat_importance = sd(importance, na.rm = TRUE),
-                p = sumlog2(pvalue),
-                .groups = "drop") %>%
-      mutate(fdr = p.adjust(p))
+      summarise(
+        n_folds = n(),
+        mean_feat_importance = mean(importance, na.rm = TRUE),
+        sd_feat_importance = sd(importance, na.rm = TRUE),
+        p = sumlog2(pvalue),
+        .groups = "drop"
+      ) %>%
+      mutate(fdr = p.adjust(p, method = "fdr"))
+  }
   
-  if (! any(summary_correlations$Significant)) {
+  if (!any(summary_correlations$Significant, na.rm = TRUE)) {
     message('No significantly well-predicted metadata measures')
   } else {
     message('The following measures were well-predicted by the microbiome using a ', toupper(ml_method), ' model:')
     message(paste(summary_correlations$measure[summary_correlations$Significant], collapse = ', '))
   }
   
-  return(list(results = summary_correlations, feat_importance = summary_feat_importance, cv_cor=cv_correlations, fold_preds=pred_per_fold_list))
+  return(list(
+    results = summary_correlations,
+    feat_importance = summary_feat_importance,
+    cv_cor = cv_metrics,
+    fold_preds = fold_preds_all
+  ))
 }
-
 ```
 
 Train the model with microbiome features + confounders and only confounders:
@@ -1080,7 +1734,7 @@ p_a <- feat_imp %>%
   theme(axis.text.x = element_text(angle = 90, hjust = 1)) +   # Adjust angle as needed)
   labs(x = "Feature", y = "Mean Feature Importance")
 
-p_a # Supplementary Figure S6A
+p_a # Supplementary Figure S8A
 
 df <- feat_imp %>% select(feature, mean_feat_importance) %>%
   inner_join(maaslin_res %>% 
@@ -1097,7 +1751,7 @@ p_b <- ggplot(df, aes(x = mean_feat_importance, y = abs_maaslin_coef)) +
   xlab("Mean Altmann feature importance (RF)") +
   ylab("Absolute Maaslin2 Coefficient")
 
-p_b # Supplementary Figure S6B
+p_b # Supplementary Figure S8B
 
 ```
 
@@ -1212,22 +1866,29 @@ get_predictability_regression_with_test <- function(feat_table,
   require(glmnet)
   require(ranger)
   require(metap)
+  require(tibble)
 
   # --- validations ---
-  if (is.null(vars_to_analyze))
+  if (is.null(vars_to_analyze)) {
     stop("Invalid 'vars_to_analyze' argument. Cannot be NULL")
-  if (!all(vars_to_analyze %in% names(metadata)))
+  }
+  if (!all(vars_to_analyze %in% names(metadata))) {
     stop("Invalid 'vars_to_analyze': some variables are missing from training metadata")
-  if (!ml_method %in% c('rf'))
+  }
+  if (!ml_method %in% c('rf')) {
     stop("Invalid 'ml_method'. Only 'rf' supported.")
-  if (!corr_method %in% c('pearson', 'spearman'))
+  }
+  if (!corr_method %in% c('pearson', 'spearman')) {
     stop("Invalid 'corr_method'. Only 'pearson' and 'spearman' supported.")
+  }
 
   has_external <- !is.null(test_feat_table) && !is.null(test_metadata)
 
-  # Fix names of features (syntactic, and do the same for external if provided)
+  # Fix names of features
   names(feat_table) <- make.names(names(feat_table))
-  if (has_external) names(test_feat_table) <- make.names(names(test_feat_table))
+  if (has_external) {
+    names(test_feat_table) <- make.names(names(test_feat_table))
+  }
 
   # Folds for CV
   n_samples <- nrow(feat_table)
@@ -1241,17 +1902,69 @@ get_predictability_regression_with_test <- function(feat_table,
   # Collectors
   cv_correlations          <- data.frame()
   cv_feat_imp              <- data.frame()
-  # store fold-level predictions (now per-measure)
   all_fold_preds_internal  <- list()
-  all_fold_preds_external  <- list()  # NEW
-  cv_correlations_external <- data.frame() # NEW
+  all_fold_preds_external  <- list()
+  cv_correlations_external <- data.frame()
 
-  # helper
-  sumlog2 <- function(ps) { ps <- ps[!is.na(ps)]; if (!length(ps)) return(NA_real_); sumlog(ps)$p }
+  # helper for p-value aggregation
+  sumlog2 <- function(ps) {
+    ps <- ps[!is.na(ps)]
+    if (!length(ps)) return(NA_real_)
+    sumlog(ps)$p
+  }
+
+  # regression metrics helper
+  calc_regression_metrics <- function(preds, true_vals, corr_method = "pearson") {
+    keep <- stats::complete.cases(preds, true_vals)
+    preds <- preds[keep]
+    true_vals <- true_vals[keep]
+
+    if (length(preds) == 0) {
+      return(list(
+        cor = NA_real_,
+        cor_p = NA_real_,
+        rmse = NA_real_,
+        mae = NA_real_,
+        r2 = NA_real_
+      ))
+    }
+
+    cor_val <- suppressWarnings(cor(preds, true_vals, method = corr_method))
+
+    cor_p_val <- tryCatch(
+      suppressWarnings(
+        cor.test(
+          preds, true_vals,
+          alternative = "greater",
+          method = corr_method,
+          exact = FALSE
+        )$p.value
+      ),
+      error = function(e) NA_real_
+    )
+
+    rmse_val <- sqrt(mean((preds - true_vals)^2, na.rm = TRUE))
+    mae_val  <- mean(abs(preds - true_vals), na.rm = TRUE)
+
+    ss_res <- sum((true_vals - preds)^2, na.rm = TRUE)
+    ss_tot <- sum((true_vals - mean(true_vals, na.rm = TRUE))^2, na.rm = TRUE)
+
+    r2_val <- if (is.na(ss_tot) || ss_tot == 0) NA_real_ else 1 - (ss_res / ss_tot)
+
+    list(
+      cor = cor_val,
+      cor_p = cor_p_val,
+      rmse = rmse_val,
+      mae = mae_val,
+      r2 = r2_val
+    )
+  }
 
   # Iterate over variables
   for (measure in vars_to_analyze) {
-    if (!quiet) message("Training model for variable: ", measure)
+    if (!quiet) {
+      message("Training model for variable: ", measure)
+    }
 
     # Join label into training features
     tmp <- feat_table %>%
@@ -1260,7 +1973,7 @@ get_predictability_regression_with_test <- function(feat_table,
         by = sample_id_column
       )
 
-    # External test set prepared once per measure (same structure)
+    # External test set prepared once per measure
     if (has_external) {
       tmp_ext <- test_feat_table %>%
         left_join(
@@ -1276,19 +1989,19 @@ get_predictability_regression_with_test <- function(feat_table,
     for (i in seq_len(nrow(folds))) {
       fold_id <- paste(folds$splits[[i]]$id, collapse = " ")
 
-      # Train/holdout split (row indices)
+      # Train/holdout split
       train_idx <- folds$splits[[i]]$in_id
       train_data_full <- tmp[train_idx, , drop = FALSE] %>% filter(!is.na(Label))
       test_data_full  <- tmp[-train_idx, , drop = FALSE] %>% filter(!is.na(Label))
 
-      # Keep a copy w/ IDs for outputs
+      # Keep IDs
       test_ids_internal <- test_data_full[[sample_id_column]]
 
-      # Drop ID col for modeling
+      # Drop ID column for modeling
       train_data <- train_data_full %>% select(-any_of(sample_id_column))
       test_data  <- test_data_full  %>% select(-any_of(sample_id_column))
 
-      # Model formula uses all features
+      # Features
       train_feats <- setdiff(names(train_data), "Label")
 
       # Train RF
@@ -1323,31 +2036,38 @@ get_predictability_regression_with_test <- function(feat_table,
       )
       pred_per_fold_internal[[i]] <- df_int
 
-      # Correlation on internal holdout
+      # Internal metrics
+      int_metrics <- calc_regression_metrics(
+        preds = df_int$preds,
+        true_vals = df_int$true_label,
+        corr_method = corr_method
+      )
+
       cv_correlations <- bind_rows(
         cv_correlations,
         data.frame(
-          measure  = measure,
-          fold_id  = fold_id,
-          test_cor = suppressWarnings(cor(df_int$preds, df_int$true_label, method = corr_method)),
-          test_cor_p = suppressWarnings(cor.test(df_int$preds, df_int$true_label,
-                                                 alternative = 'greater',
-                                                 method = corr_method,
-                                                 exact = FALSE)$p.value)
+          measure    = measure,
+          fold_id    = fold_id,
+          test_cor   = int_metrics$cor,
+          test_cor_p = int_metrics$cor_p,
+          rmse       = int_metrics$rmse,
+          mae        = int_metrics$mae,
+          r2         = int_metrics$r2
         )
       )
 
-      # --- NEW: predict on external test set using this fold's model ---
+      # Predict on external test set
       if (has_external) {
-        # align columns to training features; drop non-numeric cols except Label
         ext_keep <- intersect(names(tmp_ext), c(sample_id_column, train_feats, "Label"))
         ext_data_full <- tmp_ext[, ext_keep, drop = FALSE] %>% filter(!is.na(Label))
-        # ensure all features exist; if missing, add zeros
+
         missing_feats <- setdiff(train_feats, names(ext_data_full))
         if (length(missing_feats) > 0) {
-          for (mf in missing_feats) ext_data_full[[mf]] <- 0
+          for (mf in missing_feats) {
+            ext_data_full[[mf]] <- 0
+          }
         }
-        # order columns to match training
+
         ext_feats <- ext_data_full %>% select(all_of(train_feats))
         ext_ids   <- ext_data_full[[sample_id_column]]
         preds_ext <- predict(rf_model, ext_feats)$predictions
@@ -1362,54 +2082,72 @@ get_predictability_regression_with_test <- function(feat_table,
         )
         pred_per_fold_external[[i]] <- df_ext
 
-        # Correlation on external
+        ext_metrics <- calc_regression_metrics(
+          preds = df_ext$preds,
+          true_vals = df_ext$true_label,
+          corr_method = corr_method
+        )
+
         cv_correlations_external <- bind_rows(
           cv_correlations_external,
           data.frame(
-            measure  = measure,
-            fold_id  = fold_id,
-            test_cor = suppressWarnings(cor(df_ext$preds, df_ext$true_label, method = corr_method)),
-            test_cor_p = suppressWarnings(cor.test(df_ext$preds, df_ext$true_label,
-                                                   alternative = 'greater',
-                                                   method = corr_method,
-                                                   exact = FALSE)$p.value)
+            measure    = measure,
+            fold_id    = fold_id,
+            test_cor   = ext_metrics$cor,
+            test_cor_p = ext_metrics$cor_p,
+            rmse       = ext_metrics$rmse,
+            mae        = ext_metrics$mae,
+            r2         = ext_metrics$r2
           )
         )
       }
-    } # folds
+    }
 
     # store per-measure predictions
     all_fold_preds_internal[[measure]] <- dplyr::bind_rows(pred_per_fold_internal)
-    if (has_external)
+    if (has_external) {
       all_fold_preds_external[[measure]] <- dplyr::bind_rows(pred_per_fold_external)
-  } # measures
+    }
+  }
 
   # Summaries (internal CV)
   summary_correlations <- cv_correlations %>%
     group_by(measure) %>%
     summarise(
-      n_folds = n(),
-      mean_cor = mean(test_cor, na.rm = TRUE),
-      sd_cor   = sd(test_cor,   na.rm = TRUE),
-      p        = sumlog2(test_cor_p),
-      .groups = "drop"
+      n_folds   = n(),
+      mean_cor  = mean(test_cor, na.rm = TRUE),
+      sd_cor    = sd(test_cor, na.rm = TRUE),
+      mean_rmse = mean(rmse, na.rm = TRUE),
+      sd_rmse   = sd(rmse, na.rm = TRUE),
+      mean_mae  = mean(mae, na.rm = TRUE),
+      sd_mae    = sd(mae, na.rm = TRUE),
+      mean_r2   = mean(r2, na.rm = TRUE),
+      sd_r2     = sd(r2, na.rm = TRUE),
+      p         = sumlog2(test_cor_p),
+      .groups   = "drop"
     ) %>%
     mutate(
       fdr = p.adjust(p),
       Significant = fdr < fdr_threshold & mean_cor > corr_threshold
     )
 
-  # Summaries (external test, aggregated over folds of the model)
+  # Summaries (external test)
   summary_correlations_external <- NULL
   if (has_external) {
     summary_correlations_external <- cv_correlations_external %>%
       group_by(measure) %>%
       summarise(
-        n_folds = n(),
-        mean_cor = mean(test_cor, na.rm = TRUE),
-        sd_cor   = sd(test_cor,   na.rm = TRUE),
-        p        = sumlog2(test_cor_p),
-        .groups = "drop"
+        n_folds   = n(),
+        mean_cor  = mean(test_cor, na.rm = TRUE),
+        sd_cor    = sd(test_cor, na.rm = TRUE),
+        mean_rmse = mean(rmse, na.rm = TRUE),
+        sd_rmse   = sd(rmse, na.rm = TRUE),
+        mean_mae  = mean(mae, na.rm = TRUE),
+        sd_mae    = sd(mae, na.rm = TRUE),
+        mean_r2   = mean(r2, na.rm = TRUE),
+        sd_r2     = sd(r2, na.rm = TRUE),
+        p         = sumlog2(test_cor_p),
+        .groups   = "drop"
       ) %>%
       mutate(
         fdr = p.adjust(p),
@@ -1425,7 +2163,7 @@ get_predictability_regression_with_test <- function(feat_table,
       summarise(
         n_folds = n(),
         mean_feat_importance = mean(importance, na.rm = TRUE),
-        sd_feat_importance   = sd(importance,   na.rm = TRUE),
+        sd_feat_importance   = sd(importance, na.rm = TRUE),
         p = sumlog2(pvalue),
         .groups = "drop"
       ) %>%
@@ -1433,24 +2171,28 @@ get_predictability_regression_with_test <- function(feat_table,
   }
 
   if (!any(summary_correlations$Significant)) {
-    message('No significantly well-predicted metadata measures (internal CV).')
+    message("No significantly well-predicted metadata measures (internal CV).")
   } else {
-    message('Well-predicted (internal CV, ', toupper(ml_method), '): ',
-            paste(summary_correlations$measure[summary_correlations$Significant], collapse = ', '))
-  }
-  if (has_external && any(summary_correlations_external$Significant)) {
-    message('Well-predicted on external test: ',
-            paste(summary_correlations_external$measure[summary_correlations_external$Significant], collapse = ', '))
+    message(
+      "Well-predicted (internal CV, ", toupper(ml_method), "): ",
+      paste(summary_correlations$measure[summary_correlations$Significant], collapse = ", ")
+    )
   }
 
-  # --- Return ---
+  if (has_external && any(summary_correlations_external$Significant)) {
+    message(
+      "Well-predicted on external test: ",
+      paste(summary_correlations_external$measure[summary_correlations_external$Significant], collapse = ", ")
+    )
+  }
+
   return(list(
-    results              = summary_correlations,             # internal CV summary
-    results_external     = summary_correlations_external,    # NEW: external test summary
+    results              = summary_correlations,
+    results_external     = summary_correlations_external,
     feat_importance      = summary_feat_importance,
-    cv_cor               = cv_correlations,                  # internal fold correlations
-    cv_cor_external      = cv_correlations_external,         # NEW: external fold correlations
-    fold_preds           = all_fold_preds_internal,          # list per measure (data.frame with sample_id, preds, true_label, fold_id)
+    cv_cor               = cv_correlations,
+    cv_cor_external      = cv_correlations_external,
+    fold_preds           = all_fold_preds_internal,
     fold_preds_external  = if (has_external) all_fold_preds_external else NULL
   ))
 }
